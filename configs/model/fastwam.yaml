@@ -1,0 +1,60 @@
+_target_: fastwam.runtime.create_fastwam
+model_id: Wan-AI/Wan2.2-T2V-A14B
+tokenizer_model_id: Wan-AI/Wan2.2-T2V-A14B
+tokenizer_max_len: 128
+load_text_encoder: false
+proprio_dim: ${data.train.processor.proprio_output_dim}
+redirect_common_files: true
+mot_checkpoint_mixed_attn: false   # FSDP wraps each MoTBlock with external CheckpointWrapper; internal ckpt would double-up and OOM
+action_dit_pretrained_path: checkpoints/ActionDiT_linear_interp_A14B_alphascale_1024hdim.pt
+skip_dit_load_from_pretrain: false
+
+video_dit_config:
+  has_image_input: false
+  patch_size: [1, 2, 2]
+  in_dim: 16             # Wan2.1-VAE z_dim
+  hidden_dim: 5120       # A14B
+  ffn_dim: 13824         # A14B
+  freq_dim: 256
+  text_dim: 4096
+  out_dim: 16            # Wan2.1-VAE z_dim
+  num_heads: 40          # A14B
+  attn_head_dim: 128
+  num_layers: 40         # A14B
+  eps: 1.0e-06
+  seperated_timestep: true
+  require_clip_embedding: false
+  require_vae_embedding: false
+  fuse_vae_embedding_in_latents: true
+  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+  video_attention_mask_mode: "first_frame_causal"
+  action_conditioned: false
+  action_dim: ${data.train.processor.action_output_dim}
+  action_group_causal_mask_mode: "group_diagonal"
+
+action_dit_config:
+  action_dim: ${data.train.processor.action_output_dim}
+  hidden_dim: 1024
+  ffn_dim: 4096
+  num_heads: 40          # MoT requires match with video DiT
+  attn_head_dim: 128
+  num_layers: 40         # MoT requires match with video DiT
+  text_dim: 4096
+  freq_dim: 256
+  eps: 1.0e-06
+  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+
+video_scheduler:
+  train_shift: 12.0      # A14B T2V default
+  infer_shift: 12.0
+  num_train_timesteps: 1000
+  sigma_floor: 0.875     # high-noise expert region only
+
+action_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+  sigma_floor: 0.0       # action sees full schedule
+
+loss:
+  lambda_action: 1.0

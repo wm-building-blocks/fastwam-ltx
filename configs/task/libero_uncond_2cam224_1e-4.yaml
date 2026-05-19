@@ -1,0 +1,27 @@
+# @package _global_
+
+defaults:
+  - override /data: libero_2cam
+  - override /model: fastwam
+  - _self_
+
+# dataloading — LIBERO is 224x224 2-cam, slightly larger batch than RoboTwin OK
+batch_size: 4
+num_workers: 8
+
+model:
+  mot_checkpoint_mixed_attn: true
+
+# scheduler
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 10
+max_steps: null
+log_every: 10
+save_every: 2000
+eval_every: 200
+
+# training — effective batch = 4 x 4 = 16
+gradient_accumulation_steps: 4
+weight_decay: 1e-2
+resume: null
