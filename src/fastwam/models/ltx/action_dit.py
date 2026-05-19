@@ -232,6 +232,12 @@ class LTXAlignedActionDiT(nn.Module):
             p_flat, _ = self.prompt_adaln_single(sigma.flatten(), hidden_dtype=dtype)
             prompt_timestep = p_flat.view(B, -1, p_flat.shape[-1])
 
+        # Convert context_mask (bool/long) to LTX additive form so it can
+        # be passed directly to SDPA inside the block cross-attention.
+        if context_mask is not None and not torch.is_floating_point(context_mask):
+            from ltx_core.text_encoders.gemma.embeddings_processor import convert_to_additive_mask
+            context_mask = convert_to_additive_mask(context_mask.long(), dtype)
+
         return {
             "tokens": x,
             "freqs": pe,
