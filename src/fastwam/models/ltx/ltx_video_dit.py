@@ -868,6 +868,189 @@ class LTXVideoDiT(torch.nn.Module):
         return self.load_pretrained_state_dict(sd, strict=strict)
 
     # -- forward ---------------------------------------------------------------
+    # ====================================================================
+    # Task 8: layer-level API for MoT joint forward
+    # ====================================================================
+    # FastWAM's MoT machinery wants to iterate through the video DiT's blocks
+    # manually, intercepting each block's self-attention to perform joint
+    # attention with the action expert. To support this we expose:
+    #   - prepare(latent_5d, sigma, context, ...) -> (TransformerArgs, meta)
+    #   - postprocess(TransformerArgs, meta) -> 5D latent
+    #   - build_video_to_video_mask(...) -> (T_v, T_v) bool mask
+    # The blocks themselves remain ltx_core.BasicAVTransformerBlock instances;
+    # MoT calls their attn1.to_q/to_k/to_v/q_norm/k_norm/to_out attributes
+    # directly when running joint attention.
+
+    def prepare(
+        self,
+        latent_5d,
+        sigma,
+        context,
+        context_mask=None,
+        video_self_attention_mask=None,
+        perturbations=None,
+    ):
+        """Convert 5D pixel-latent + conditioning into a TransformerArgs ready
+        for block-by-block forward.
+
+        Args:
+            latent_5d: (B, C=in_channels=128, F, H, W) tensor from the VAE.
+            sigma: (B,) diffusion noise level.
+            context: (B, T_text, inner_dim=4096) text embeddings from
+                LTXTextEncoder (already projected to inner_dim).
+            context_mask: (B, T_text) binary mask, 1 for valid tokens.
+            video_self_attention_mask: optional (B, T, T) self-attention mask.
+                ``None`` means full attention; pass FastWAM-style masks here.
+            perturbations: BatchedPerturbationConfig; ``None`` defaults to empty.
+
+        Returns:
+            (video_args, meta) where meta carries token-grid info for downstream
+            mask construction.
+        """
+        from ltx_core.guidance.perturbations import BatchedPerturbationConfig
+        from ltx_core.model.transformer.modality import Modality
+
+        B, C, F, H, W = latent_5d.shape
+        T = F * H * W
+        device = latent_5d.device
+
+        # (B, C, F, H, W) -> (B, T=F*H*W, C) in time-major then h-major then w-major
+        x_tokens = latent_5d.flatten(2).transpose(1, 2).contiguous()
+
+        # Build positions (B, 3, T) where dim-1 indexes (time, height, width).
+        t_idx = torch.arange(F, device=device)
+        h_idx = torch.arange(H, device=device)
+        w_idx = torch.arange(W, device=device)
+        tt, hh, ww = torch.meshgrid(t_idx, h_idx, w_idx, indexing="ij")
+        positions = torch.stack(
+            [tt.flatten(), hh.flatten(), ww.flatten()], dim=0
+        ).to(dtype=torch.float32 if self._inner.double_precision_rope else x_tokens.dtype)
+        # LTX with use_middle_indices_grid=True expects (B, 3, T, 2) where the
+        # last dim is (start, end) of each token's grid extent. For point
+        # tokens we set start==end so the midpoint equals the position itself.
+        positions = positions.unsqueeze(0).expand(B, -1, -1).contiguous()       # (B, 3, T)
+        positions = positions.unsqueeze(-1).expand(-1, -1, -1, 2).contiguous()  # (B, 3, T, 2)
+
+        # Per-token timesteps: broadcast batch-level sigma to all T tokens so we
+        # match LTX's per-token timestep_embedding code path with no behavior
+        # change for batch-shared t.
+        if sigma.ndim == 0:
+            sigma = sigma.expand(B)
+        timesteps = sigma.view(B, 1).expand(B, T).contiguous()  # (B, T)
+
+        modality = Modality(
+            latent=x_tokens,
+            sigma=sigma,
+            timesteps=timesteps,
+            positions=positions,
+            context=context,
+            enabled=True,
+            context_mask=context_mask,
+            attention_mask=video_self_attention_mask,
+        )
+
+        video_args = self._inner.video_args_preprocessor.prepare(modality, cross_modality=None)
+
+        if perturbations is None:
+            perturbations = BatchedPerturbationConfig.empty(B)
+
+        meta = {
+            "B": B,
+            "T": T,
+            "F": F,
+            "H": H,
+            "W": W,
+            "tokens_per_frame": H * W,
+            "num_frames": F,
+            "perturbations": perturbations,
+        }
+        return video_args, meta
+
+    def run_blocks(self, video_args, perturbations=None):
+        """Convenience: run all transformer blocks sequentially with audio=None.
+
+        Equivalent to LTXModel._process_transformer_blocks but exposed so that
+        MoT can choose between this 'native' loop (when joint attention is
+        disabled) and its own joint-attention loop.
+        """
+        from ltx_core.guidance.perturbations import BatchedPerturbationConfig
+
+        if perturbations is None:
+            perturbations = BatchedPerturbationConfig.empty(video_args.x.shape[0])
+
+        for block in self.blocks:
+            video_args, _ = block(video=video_args, audio=None, perturbations=perturbations)
+        return video_args
+
+    def postprocess(self, video_args, meta):
+        """Apply final scale_shift + norm_out + proj_out, then reshape back to 5D.
+
+        Returns a (B, C_out=128, F, H, W) tensor matching the original
+        ``latent_5d.shape`` (with C swapped to out_channels).
+        """
+        x = self._inner._process_output(
+            self._inner.scale_shift_table,
+            self._inner.norm_out,
+            self._inner.proj_out,
+            video_args.x,
+            video_args.embedded_timestep,
+        )
+        # x shape: (B, T, out_channels)
+        B = meta["B"]
+        F, H, W = meta["F"], meta["H"], meta["W"]
+        # (B, T, C) -> (B, C, F, H, W)
+        x_5d = x.transpose(1, 2).reshape(B, -1, F, H, W).contiguous()
+        return x_5d
+
+    def build_video_to_video_mask(
+        self,
+        video_seq_len: int,
+        video_tokens_per_frame: int,
+        device,
+        mode: str = "bidirectional",
+    ):
+        """Port of wan22 WanVideoDiT.build_video_to_video_mask.
+
+        Returns a (video_seq_len, video_seq_len) bool tensor where ``True``
+        means "query at row i can attend to key at column j". FastWAM uses this
+        as the video->video block of the larger MoT attention mask.
+
+        Modes:
+          - "bidirectional": full attention (all True)
+          - "per_frame_causal": frame i can attend to frames <= i
+          - "first_frame_causal": first frame cannot see future frames; later
+              frames see everything (FastWAM RoboTwin default)
+        """
+        if video_seq_len <= 0:
+            raise ValueError(f"`video_seq_len` must be positive, got {video_seq_len}")
+        if video_tokens_per_frame <= 0:
+            raise ValueError(f"`video_tokens_per_frame` must be positive, got {video_tokens_per_frame}")
+
+        if mode == "bidirectional":
+            return torch.ones((video_seq_len, video_seq_len), dtype=torch.bool, device=device)
+
+        if mode == "per_frame_causal":
+            if video_seq_len % video_tokens_per_frame != 0:
+                raise ValueError(
+                    "`video_seq_len` must be divisible by `video_tokens_per_frame` in `per_frame_causal` mode, "
+                    f"got {video_seq_len} and {video_tokens_per_frame}"
+                )
+            num_video_frames = video_seq_len // video_tokens_per_frame
+            frame_causal = torch.tril(
+                torch.ones((num_video_frames, num_video_frames), dtype=torch.bool, device=device)
+            )
+            return frame_causal.repeat_interleave(video_tokens_per_frame, dim=0).repeat_interleave(
+                video_tokens_per_frame, dim=1
+            )
+
+        if mode == "first_frame_causal":
+            video_mask = torch.ones((video_seq_len, video_seq_len), dtype=torch.bool, device=device)
+            first_frame_tokens = min(video_tokens_per_frame, video_seq_len)
+            video_mask[:first_frame_tokens, first_frame_tokens:] = False
+            return video_mask
+
+        raise ValueError(f"Unsupported video attention mask mode: {mode}")
+
     def forward(
         self,
         video,  # ltx_core.model.transformer.modality.Modality
