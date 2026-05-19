@@ -35,7 +35,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         video_size=[384, 640],
         camera_key=None,
         processor=None,
-        text_embedding_cache_dir=None,  # deprecated; on-the-fly T5 is used now
+        text_embedding_cache_dir=None,  # path with precomputed text emb .pt files
+        text_cache_slug: str = "t5_len{context_len}.wan22t2va14b",  # override to e.g. 'ltx23_gemma3_12b_v2connector'
         context_len=128,
         pretrained_norm_stats=None,
         val_set_proportion=0.05,
@@ -75,6 +76,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
         self.video_size = video_size
         self.text_embedding_cache_dir = text_embedding_cache_dir
+        self.text_cache_slug = str(text_cache_slug)
         self.context_len = context_len
         self.skip_padding_as_possible = skip_padding_as_possible
         self.max_padding_retry = max_padding_retry
@@ -317,7 +319,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         if self.text_embedding_cache_dir is not None:
             cache_path = os.path.join(
                 self.text_embedding_cache_dir,
-                f"{hashed}.t5_len{self.context_len}.wan22t2va14b.pt",
+                f"{hashed}.{self.text_cache_slug.format(context_len=self.context_len)}.pt",
             )
             if os.path.exists(cache_path):
                 payload = torch.load(cache_path, map_location="cpu")
