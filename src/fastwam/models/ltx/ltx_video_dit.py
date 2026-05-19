@@ -307,7 +307,7 @@ class Head(nn.Module):
         return x
 
 
-class LTXVideoDiT(torch.nn.Module):
+class _LegacyWanLikeDiT(torch.nn.Module):
     def __init__(
         self,
         hidden_dim: int,
@@ -664,3 +664,228 @@ class LTXVideoDiT(torch.nn.Module):
                 x_tokens = block(x_tokens, context_emb, t_mod, freqs, context_mask=context_attn_mask, self_attn_mask=self_attn_mask)
 
         return self.post_dit(x_tokens, pre_state)
+
+
+# ============================================================================
+# LTX-2 backbone adapter (Task 4 / 2026-05-19)
+# ============================================================================
+# Wraps ltx-core's LTXModel(VideoOnly) to fit FastWAM's video-backbone interface.
+# The legacy Wan-style classes above (DiTBlock, _LegacyWanLikeDiT, helpers like
+# flash_attention/modulate/rope_apply) remain for ActionDiT + MoT during the
+# transition; Task 9 will replace those.
+
+import json as _json
+from pathlib import Path as _Path
+from typing import Any as _Any, Dict as _Dict, Optional as _Optional, Tuple as _Tuple
+
+try:
+    import safetensors as _safetensors
+    from ltx_core.model.transformer import (
+        LTXModel as _LTXModel,
+        Modality as _Modality,
+        LTXV_MODEL_COMFY_RENAMING_MAP as _LTXV_RENAMING,
+        LTXVideoOnlyModelConfigurator as _LTXVideoOnlyConfigurator,
+    )
+    from ltx_core.model.transformer.model import LTXModelType as _LTXModelType
+    _LTX_CORE_OK = True
+    _LTX_CORE_ERR = None
+except Exception as _e:  # noqa: BLE001
+    _LTX_CORE_OK = False
+    _LTX_CORE_ERR = _e
+
+
+# ---- Audio key filter ----------------------------------------------------------
+# Tokens that, when present anywhere in a state-dict key, mark it as belonging
+# to the audio sub-model or to AV cross-attention layers. In LTX-2.3 VideoOnly
+# none of these modules are instantiated, so they must be filtered out before
+# load_state_dict(strict=...).
+_AUDIO_FILTER_TOKENS: _Tuple[str, ...] = (
+    "audio_patchify_proj",
+    "audio_adaln_single",
+    "audio_scale_shift_table",
+    "audio_norm_out",
+    "audio_proj_out",
+    "audio_args_preprocessor",
+    "audio_caption_projection",
+    "audio_prompt_adaln_single",
+    "audio_prompt_scale_shift_table",
+    "audio_attn1",
+    "audio_attn2",
+    "audio_ff",
+    "video_to_audio_attn",
+    "audio_to_video_attn",
+    "audio_embeddings_connector",
+    "video_embeddings_connector",
+    "embeddings_connector",
+    "av_ca_audio_scale_shift_adaln_single",
+    "av_ca_v2a_gate_adaln_single",
+    "av_ca_a2v_gate_adaln_single",
+    "av_ca_video_scale_shift_adaln_single",
+    "scale_shift_table_a2v_ca_audio",
+    "scale_shift_table_a2v_ca_video",
+)
+
+
+def ltx_video_dit_filter_audio(state_dict: _Dict[str, _Any]) -> _Dict[str, _Any]:
+    """Drop every key whose name contains an audio / AV-cross-attn token.
+
+    Reason: LTX-2.3's safetensors file holds both the 14B video DiT and the
+    5B audio DiT in a single shard, but VideoOnly model instantiation never
+    creates the audio submodules. Loading without filtering causes hundreds
+    of unexpected_keys.
+    """
+    out: _Dict[str, _Any] = {}
+    dropped = 0
+    for k, v in state_dict.items():
+        if any(tok in k for tok in _AUDIO_FILTER_TOKENS):
+            dropped += 1
+            continue
+        out[k] = v
+    return out
+
+
+def _strip_comfy_prefix(state_dict: _Dict[str, _Any]) -> _Dict[str, _Any]:
+    """Select DiT keys (``model.diffusion_model.X``) and strip the prefix.
+
+    LTX-2.3 safetensors files bundle multiple modules (DiT, VAE, audio_vae,
+    vocoder, text_embedding_projection). Only ``model.diffusion_model.*``
+    belongs to the LTXModel transformer; everything else is discarded here
+    and loaded by its own adapter.
+    """
+    pref = "model.diffusion_model."
+    return {k[len(pref):]: v for k, v in state_dict.items() if k.startswith(pref)}
+
+
+def load_ltx_config_from_safetensors(path: str) -> _Dict[str, _Any]:
+    """Read the ``__metadata__["config"]`` JSON blob from an LTX safetensors file.
+
+    Returns the parsed dict (top-level keys typically ``transformer``, ``vae``,
+    possibly ``audio_vae`` etc.). Raises if the file has no embedded config.
+    """
+    with _safetensors.safe_open(path, framework="pt") as f:
+        md = f.metadata() or {}
+    if "config" not in md:
+        raise ValueError(
+            f"safetensors file {path!s} has no '__metadata__[\"config\"]' blob"
+        )
+    return _json.loads(md["config"])
+
+
+def load_ltx_safetensors_state_dict(path: str, device: str = "cpu") -> _Dict[str, _Any]:
+    """Stream the safetensors tensors into a state-dict (CPU by default)."""
+    out: _Dict[str, _Any] = {}
+    with _safetensors.safe_open(path, framework="pt", device=device) as f:
+        for k in f.keys():
+            out[k] = f.get_tensor(k)
+    return out
+
+
+# ---- LTXVideoDiT wrapper -------------------------------------------------------
+class LTXVideoDiT(torch.nn.Module):
+    """FastWAM-side adapter wrapping ``ltx_core.LTXModel(model_type=VideoOnly)``.
+
+    Exposes the attribute surface FastWAM scaffolding (MoT, FSDP wrap policy,
+    ``preprocess_action_dit_backbone.py``) expects:
+        ``hidden_dim``, ``num_heads``, ``attn_head_dim``, ``num_layers``,
+        ``blocks`` (alias of ``self._inner.transformer_blocks``).
+
+    Construction options:
+        ``LTXVideoDiT(config=..., use_gradient_checkpointing=...)`` — full
+          LTX safetensors config dict (the one inside ``__metadata__["config"]``).
+        ``LTXVideoDiT.from_safetensors(path, ...)`` — parse metadata + build.
+    """
+
+    def __init__(
+        self,
+        *,
+        config: _Optional[_Dict[str, _Any]] = None,
+        use_gradient_checkpointing: bool = False,
+    ):
+        super().__init__()
+        if not _LTX_CORE_OK:
+            raise ImportError(
+                "ltx-core unavailable; pip install -e third_party/ltx-2/packages/ltx-core. "
+                f"Original error: {_LTX_CORE_ERR!r}"
+            )
+        if config is None:
+            raise ValueError(
+                "LTXVideoDiT requires `config=<dict>`. Use "
+                "LTXVideoDiT.from_safetensors(path) to read it from a checkpoint."
+            )
+
+        self._config = config
+        # Use the official VideoOnly configurator. It validates non-default keys
+        # and assembles caption_projection appropriately for 19B vs 22B models.
+        self._inner: torch.nn.Module = _LTXVideoOnlyConfigurator.from_config(config)
+
+        # FastWAM-conventional attribute exposure.
+        tcfg = config.get("transformer", {})
+        self.hidden_dim: int = self._inner.inner_dim
+        self.num_heads: int = tcfg.get("num_attention_heads", 32)
+        self.attn_head_dim: int = tcfg.get("attention_head_dim", 128)
+        self.num_layers: int = tcfg.get("num_layers", 48)
+        self.in_dim: int = tcfg.get("in_channels", 128)
+        self.out_dim: int = tcfg.get("out_channels", 128)
+        # Alias so MoT / preprocess scripts can iterate `model.blocks`.
+        self.blocks = self._inner.transformer_blocks
+
+        self.use_gradient_checkpointing = use_gradient_checkpointing
+        if use_gradient_checkpointing:
+            self._inner.set_gradient_checkpointing(True)
+
+    @classmethod
+    def from_safetensors(
+        cls,
+        path: str,
+        use_gradient_checkpointing: bool = False,
+    ) -> "LTXVideoDiT":
+        cfg = load_ltx_config_from_safetensors(path)
+        return cls(config=cfg, use_gradient_checkpointing=use_gradient_checkpointing)
+
+    # -- weight loading --------------------------------------------------------
+    def load_pretrained_state_dict(
+        self,
+        state_dict: _Dict[str, _Any],
+        strict: bool = False,
+    ) -> _Tuple[list, list]:
+        """Load an LTX safetensors state dict with comfy prefix stripping +
+        audio key filtering. Returns ``(missing_keys, unexpected_keys)``."""
+        sd = _strip_comfy_prefix(state_dict)
+        sd = ltx_video_dit_filter_audio(sd)
+        result = self._inner.load_state_dict(sd, strict=strict)
+        # torch's return type changed across versions; normalize to lists.
+        missing = list(getattr(result, "missing_keys", []))
+        unexpected = list(getattr(result, "unexpected_keys", []))
+        return missing, unexpected
+
+    def load_pretrained_safetensors(
+        self,
+        path: str,
+        strict: bool = False,
+        device: str = "cpu",
+    ) -> _Tuple[list, list]:
+        sd = load_ltx_safetensors_state_dict(path, device=device)
+        return self.load_pretrained_state_dict(sd, strict=strict)
+
+    # -- forward ---------------------------------------------------------------
+    def forward(
+        self,
+        video,  # ltx_core.model.transformer.modality.Modality
+        perturbations=None,
+    ):
+        """Run one transformer pass, forcing audio=None (VideoOnly).
+
+        ``video`` must already be a ``ltx_core.Modality``. Higher-level wrappers
+        (FastWAM ``forward(x, context, t, ...)``) will be added in Task 9 once
+        MoT integration is in place.
+        """
+        return self._inner(video=video, audio=None, perturbations=perturbations)
+
+
+__all__ = [
+    *globals().get("__all__", []),
+    "LTXVideoDiT",
+    "ltx_video_dit_filter_audio",
+    "load_ltx_config_from_safetensors",
+    "load_ltx_safetensors_state_dict",
+]
