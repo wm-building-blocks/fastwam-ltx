@@ -1,342 +1,237 @@
-import math
+"""
+LTX-2 text encoder adapter (Task 6 / 2026-05-19).
+
+Bridges Gemma-3-12B's all-layer hidden states to the 4096-d cross-attention
+context that LTXVideoDiT expects, by wrapping ltx-core's EmbeddingsProcessor
+(FeatureExtractorV2 + Embeddings1DConnector + 128 learnable register tokens).
+
+This file replaces the previous Wan/UMT5-based encoder. The original Wan
+implementation (previously living in ltx_text_encoder.py) is intentionally
+not preserved — it does not apply to the LTX backbone.
+
+Weight provenance (LTX-2.3-22b-dev safetensors → EmbeddingsProcessor):
+    text_embedding_projection.video_aggregate_embed.{w,b}
+        → feature_extractor.video_aggregate_embed.{w,b}
+    model.diffusion_model.video_embeddings_connector.X
+        → video_connector.X
+
+Audio side (audio_aggregate_embed, audio_embeddings_connector) is intentionally
+dropped: VideoOnly mode never runs audio through the processor.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from transformers import AutoTokenizer
-import html
-import string
+
 try:
-    import ftfy
-except ModuleNotFoundError:
-    class _FTFY:
-        @staticmethod
-        def fix_text(text):
-            return text
-
-    ftfy = _FTFY()
-try:
-    import regex as re
-except ModuleNotFoundError:
-    import re
-
-def fp16_clamp(x):
-    if x.dtype == torch.float16 and torch.isinf(x).any():
-        clamp = torch.finfo(x.dtype).max - 1000
-        x = torch.clamp(x, min=-clamp, max=clamp)
-    return x
+    import safetensors
+    from ltx_core.text_encoders.gemma import (
+        EmbeddingsProcessorConfigurator,
+    )
+    from ltx_core.text_encoders.gemma.embeddings_processor import (
+        EmbeddingsProcessor,
+        EmbeddingsProcessorOutput,
+    )
+    _LTX_TXT_OK = True
+    _LTX_TXT_ERR = None
+except Exception as _e:  # noqa: BLE001
+    _LTX_TXT_OK = False
+    _LTX_TXT_ERR = _e
 
 
-class GELU(nn.Module):
-
-    def forward(self, x):
-        return 0.5 * x * (1.0 + torch.tanh(
-            math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
-
-
-class T5LayerNorm(nn.Module):
-
-    def __init__(self, dim, eps=1e-6):
-        super(T5LayerNorm, self).__init__()
-        self.dim = dim
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x):
-        x = x * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) +
-                            self.eps)
-        if self.weight.dtype in [torch.float16, torch.bfloat16]:
-            x = x.type_as(self.weight)
-        return self.weight * x
+# Constants from LTX-2.3 metadata (see Phase 1 research).
+GEMMA_HIDDEN_SIZE = 3840
+GEMMA_NUM_HIDDEN_LAYERS = 48
+GEMMA_FEATURE_DIM = GEMMA_HIDDEN_SIZE * (GEMMA_NUM_HIDDEN_LAYERS + 1)  # 49 * 3840 = 188160
+LTX_DIT_TEXT_DIM = 4096
+LTX_CONNECTOR_NUM_REGISTERS = 128
 
 
-class T5Attention(nn.Module):
+def _build_embeddings_processor_state_dict(ckpt_path: str) -> Dict[str, torch.Tensor]:
+    """Build a state dict for ``EmbeddingsProcessor`` (video-only) by remapping
+    the two key namespaces in the LTX-2.3 checkpoint.
+    """
+    sd: Dict[str, torch.Tensor] = {}
+    audio_drop = 0
+    fe_pref = "text_embedding_projection."
+    con_pref = "model.diffusion_model.video_embeddings_connector."
+    with safetensors.safe_open(ckpt_path, framework="pt") as f:
+        for k in f.keys():
+            if k.startswith(fe_pref):
+                # both video_aggregate_embed.* and audio_aggregate_embed.* → feature_extractor.*
+                # We keep audio side here so the FeatureExtractorV2 module has all params
+                # populated; the audio branch simply never runs in video-only forwards.
+                sd["feature_extractor." + k[len(fe_pref):]] = f.get_tensor(k)
+            elif k.startswith(con_pref):
+                sd["video_connector." + k[len(con_pref):]] = f.get_tensor(k)
+    return sd
 
-    def __init__(self, dim, dim_attn, num_heads, dropout=0.1):
-        assert dim_attn % num_heads == 0
-        super(T5Attention, self).__init__()
-        self.dim = dim
-        self.dim_attn = dim_attn
-        self.num_heads = num_heads
-        self.head_dim = dim_attn // num_heads
 
-        # layers
-        self.q = nn.Linear(dim, dim_attn, bias=False)
-        self.k = nn.Linear(dim, dim_attn, bias=False)
-        self.v = nn.Linear(dim, dim_attn, bias=False)
-        self.o = nn.Linear(dim_attn, dim, bias=False)
-        self.dropout = nn.Dropout(dropout)
+class LTXTextEncoder(nn.Module):
+    """LTX-2 text encoder adapter.
 
-    def forward(self, x, context=None, mask=None, pos_bias=None):
+    Wraps the ``EmbeddingsProcessor`` (FeatureExtractorV2 + Embeddings1DConnector
+    + 128 learnable registers). Two intended usage modes:
+
+    1. **From pre-computed Gemma hidden states** (training, expected path):
+       ``encoder.process_features(hidden_states, attention_mask)``
+       where ``hidden_states`` is the tuple returned by Gemma's
+       ``output_hidden_states=True`` forward (length 49 for Gemma-3-12B-it).
+
+    2. **End-to-end** (Task 12 cache precompute will use this):
+       ``encoder.encode(prompts, device)`` — runs Gemma internally. Requires
+       Gemma to be loaded first via ``attach_gemma(...)``.
+
+    Output shape: ``(B, T, 4096)`` plus a binary ``(B, T)`` attention mask.
+    """
+
+    def __init__(
+        self,
+        embeddings_processor: "EmbeddingsProcessor",
+        *,
+        dit_text_dim: int = LTX_DIT_TEXT_DIM,
+    ) -> None:
+        super().__init__()
+        if not _LTX_TXT_OK:
+            raise ImportError(
+                "ltx-core text encoder imports failed; pip install -e "
+                "third_party/ltx-2/packages/ltx-core. "
+                f"Original error: {_LTX_TXT_ERR!r}"
+            )
+        self.embeddings_processor = embeddings_processor
+        self.dit_text_dim = dit_text_dim
+        self.gemma: Optional[nn.Module] = None
+        self.tokenizer = None
+
+    # ----- construction ----------------------------------------------------
+    @classmethod
+    def from_config(cls, config: Dict[str, Any]) -> "LTXTextEncoder":
+        """Build the EmbeddingsProcessor from the LTX safetensors metadata
+        config. We drop the audio connector so audio weights need not be
+        loaded; this matches LTXModelType.VideoOnly on the DiT side."""
+        ep = EmbeddingsProcessorConfigurator.from_config(config)
+        # Drop audio side: video-only inference.
+        ep.audio_connector = None
+        # If feature_extractor has audio side, neuter the attribute so weight
+        # loading does not produce phantom missing keys. We keep the module
+        # itself (it's small) but never call it.
+        return cls(embeddings_processor=ep)
+
+    # ----- weight loading -------------------------------------------------
+    def load_pretrained_state_dict(
+        self,
+        ltx_state_dict_remapped: Dict[str, torch.Tensor],
+        strict: bool = False,
+        drop_audio_unexpected: bool = True,
+    ) -> Tuple[list, list]:
+        """Load a *pre-remapped* state dict (keys already shaped for
+        EmbeddingsProcessor). Use ``load_pretrained_safetensors`` for the
+        common path that does the remapping for you."""
+        result = self.embeddings_processor.load_state_dict(
+            ltx_state_dict_remapped, strict=strict
+        )
+        missing = list(getattr(result, "missing_keys", []))
+        unexpected = list(getattr(result, "unexpected_keys", []))
+        if drop_audio_unexpected:
+            unexpected = [k for k in unexpected if not k.startswith("audio_")]
+        return missing, unexpected
+
+    def load_pretrained_safetensors(
+        self,
+        ltx_ckpt_path: str,
+        strict: bool = False,
+    ) -> Tuple[list, list]:
+        sd = _build_embeddings_processor_state_dict(ltx_ckpt_path)
+        return self.load_pretrained_state_dict(sd, strict=strict)
+
+    # ----- Gemma plumbing (deferred to cache precompute time) -------------
+    def attach_gemma(self, gemma_root: str, torch_dtype: torch.dtype = torch.bfloat16) -> None:
+        """Load Gemma-3-12B-it (and tokenizer) lazily. Used by the cache-precompute
+        script; training reads pre-computed embeddings from disk and does *not*
+        need Gemma in memory."""
+        from transformers import AutoTokenizer, Gemma3ForConditionalGeneration
+
+        self.tokenizer = AutoTokenizer.from_pretrained(gemma_root)
+        gemma = Gemma3ForConditionalGeneration.from_pretrained(
+            gemma_root, torch_dtype=torch_dtype
+        ).eval()
+        self.gemma = gemma
+
+    # ----- forward APIs ---------------------------------------------------
+    def process_features(
+        self,
+        hidden_states: Tuple[torch.Tensor, ...],
+        attention_mask: torch.Tensor,
+        padding_side: str = "left",
+    ) -> "EmbeddingsProcessorOutput":
+        """Run FeatureExtractorV2 + video Connector on pre-computed Gemma
+        hidden states. ``hidden_states`` must be a tuple of length 49 (one per
+        Gemma transformer layer + the embedding output).
+
+        We bypass ``embeddings_processor.process_hidden_states`` because the
+        upstream pipeline returns both video and audio features unconditionally
+        and then asserts ``audio_connector is not None``. In video-only mode we
+        drop the audio features explicitly before the connector stage.
         """
-        x:          [B, L1, C].
-        context:    [B, L2, C] or None.
-        mask:       [B, L2] or [B, L1, L2] or None.
-        """
-        # check inputs
-        context = x if context is None else context
-        b, n, c = x.size(0), self.num_heads, self.head_dim
+        from ltx_core.text_encoders.gemma.embeddings_processor import convert_to_additive_mask
 
-        # compute query, key, value
-        q = self.q(x).view(b, -1, n, c)
-        k = self.k(context).view(b, -1, n, c)
-        v = self.v(context).view(b, -1, n, c)
+        ep = self.embeddings_processor
+        if ep.feature_extractor is None:
+            raise ValueError("feature_extractor is required for process_features()")
+        video_feats, _audio_feats = ep.feature_extractor(
+            hidden_states, attention_mask, padding_side
+        )
+        additive_mask = convert_to_additive_mask(attention_mask, video_feats.dtype)
+        video_enc, _audio_enc, binary_mask = ep.create_embeddings(
+            video_feats, None, additive_mask
+        )
+        return EmbeddingsProcessorOutput(video_enc, None, binary_mask)
 
-        # attention bias
-        attn_bias = x.new_zeros(b, n, q.size(1), k.size(1))
-        if pos_bias is not None:
-            attn_bias += pos_bias
-        if mask is not None:
-            assert mask.ndim in [2, 3]
-            mask = mask.view(b, 1, 1,
-                             -1) if mask.ndim == 2 else mask.unsqueeze(1)
-            attn_bias.masked_fill_(mask == 0, torch.finfo(x.dtype).min)
-
-        # compute attention (T5 does not use scaling)
-        attn = torch.einsum('binc,bjnc->bnij', q, k) + attn_bias
-        attn = F.softmax(attn.float(), dim=-1).type_as(attn)
-        x = torch.einsum('bnij,bjnc->binc', attn, v)
-
-        # output
-        x = x.reshape(b, -1, n * c)
-        x = self.o(x)
-        x = self.dropout(x)
-        return x
-
-
-class T5FeedForward(nn.Module):
-
-    def __init__(self, dim, dim_ffn, dropout=0.1):
-        super(T5FeedForward, self).__init__()
-        self.dim = dim
-        self.dim_ffn = dim_ffn
-
-        # layers
-        self.gate = nn.Sequential(nn.Linear(dim, dim_ffn, bias=False), GELU())
-        self.fc1 = nn.Linear(dim, dim_ffn, bias=False)
-        self.fc2 = nn.Linear(dim_ffn, dim, bias=False)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        x = self.fc1(x) * self.gate(x)
-        x = self.dropout(x)
-        x = self.fc2(x)
-        x = self.dropout(x)
-        return x
+    @torch.no_grad()
+    def encode(
+        self,
+        prompts: List[str],
+        device: torch.device,
+        max_tokens: int = 256,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """End-to-end text encode. Requires :py:meth:`attach_gemma` to have
+        been called first. Returns ``(video_encoding, binary_attention_mask)``
+        where the encoding shape is ``(B, T, 4096)``."""
+        if self.gemma is None or self.tokenizer is None:
+            raise RuntimeError(
+                "Call attach_gemma(gemma_root) before encode(). Training paths "
+                "should normally precompute embeddings to disk; this method "
+                "exists mostly for the cache-precompute script."
+            )
+        tok = self.tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=max_tokens,
+        ).to(device)
+        out = self.gemma(
+            input_ids=tok["input_ids"],
+            attention_mask=tok["attention_mask"],
+            output_hidden_states=True,
+        )
+        hidden = out.hidden_states  # tuple of 49 tensors, each (B, T, 3840)
+        ep_out = self.process_features(
+            hidden_states=hidden,
+            attention_mask=tok["attention_mask"],
+            padding_side=getattr(self.tokenizer, "padding_side", "left"),
+        )
+        return ep_out.video_encoding, ep_out.attention_mask
 
 
-class T5SelfAttention(nn.Module):
-
-    def __init__(self,
-                 dim,
-                 dim_attn,
-                 dim_ffn,
-                 num_heads,
-                 num_buckets,
-                 shared_pos=True,
-                 dropout=0.1):
-        super(T5SelfAttention, self).__init__()
-        self.dim = dim
-        self.dim_attn = dim_attn
-        self.dim_ffn = dim_ffn
-        self.num_heads = num_heads
-        self.num_buckets = num_buckets
-        self.shared_pos = shared_pos
-
-        # layers
-        self.norm1 = T5LayerNorm(dim)
-        self.attn = T5Attention(dim, dim_attn, num_heads, dropout)
-        self.norm2 = T5LayerNorm(dim)
-        self.ffn = T5FeedForward(dim, dim_ffn, dropout)
-        self.pos_embedding = None if shared_pos else T5RelativeEmbedding(
-            num_buckets, num_heads, bidirectional=True)
-
-    def forward(self, x, mask=None, pos_bias=None):
-        e = pos_bias if self.shared_pos else self.pos_embedding(
-            x.size(1), x.size(1))
-        x = fp16_clamp(x + self.attn(self.norm1(x), mask=mask, pos_bias=e))
-        x = fp16_clamp(x + self.ffn(self.norm2(x)))
-        return x
-
-
-class T5RelativeEmbedding(nn.Module):
-
-    def __init__(self, num_buckets, num_heads, bidirectional, max_dist=128):
-        super(T5RelativeEmbedding, self).__init__()
-        self.num_buckets = num_buckets
-        self.num_heads = num_heads
-        self.bidirectional = bidirectional
-        self.max_dist = max_dist
-
-        # layers
-        self.embedding = nn.Embedding(num_buckets, num_heads)
-
-    def forward(self, lq, lk):
-        device = self.embedding.weight.device
-        # rel_pos = torch.arange(lk).unsqueeze(0).to(device) - \
-        #     torch.arange(lq).unsqueeze(1).to(device)
-        rel_pos = torch.arange(lk, device=device).unsqueeze(0) - \
-            torch.arange(lq, device=device).unsqueeze(1)
-        rel_pos = self._relative_position_bucket(rel_pos)
-        rel_pos_embeds = self.embedding(rel_pos)
-        rel_pos_embeds = rel_pos_embeds.permute(2, 0, 1).unsqueeze(
-            0)  # [1, N, Lq, Lk]
-        return rel_pos_embeds.contiguous()
-
-    def _relative_position_bucket(self, rel_pos):
-        # preprocess
-        if self.bidirectional:
-            num_buckets = self.num_buckets // 2
-            rel_buckets = (rel_pos > 0).long() * num_buckets
-            rel_pos = torch.abs(rel_pos)
-        else:
-            num_buckets = self.num_buckets
-            rel_buckets = 0
-            rel_pos = -torch.min(rel_pos, torch.zeros_like(rel_pos))
-
-        # embeddings for small and large positions
-        max_exact = num_buckets // 2
-        rel_pos_large = max_exact + (torch.log(rel_pos.float() / max_exact) /
-                                     math.log(self.max_dist / max_exact) *
-                                     (num_buckets - max_exact)).long()
-        rel_pos_large = torch.min(
-            rel_pos_large, torch.full_like(rel_pos_large, num_buckets - 1))
-        rel_buckets += torch.where(rel_pos < max_exact, rel_pos, rel_pos_large)
-        return rel_buckets
-
-def init_weights(m):
-    if isinstance(m, T5LayerNorm):
-        nn.init.ones_(m.weight)
-    elif isinstance(m, T5FeedForward):
-        nn.init.normal_(m.gate[0].weight, std=m.dim**-0.5)
-        nn.init.normal_(m.fc1.weight, std=m.dim**-0.5)
-        nn.init.normal_(m.fc2.weight, std=m.dim_ffn**-0.5)
-    elif isinstance(m, T5Attention):
-        nn.init.normal_(m.q.weight, std=(m.dim * m.dim_attn)**-0.5)
-        nn.init.normal_(m.k.weight, std=m.dim**-0.5)
-        nn.init.normal_(m.v.weight, std=m.dim**-0.5)
-        nn.init.normal_(m.o.weight, std=(m.num_heads * m.dim_attn)**-0.5)
-    elif isinstance(m, T5RelativeEmbedding):
-        nn.init.normal_(
-            m.embedding.weight, std=(2 * m.num_buckets * m.num_heads)**-0.5)
-
-
-class LTXTextEncoder(torch.nn.Module):
-
-    def __init__(self,
-                 vocab=256384,
-                 dim=4096,
-                 dim_attn=4096,
-                 dim_ffn=10240,
-                 num_heads=64,
-                 num_layers=24,
-                 num_buckets=32,
-                 shared_pos=False,
-                 dropout=0.1):
-        super(LTXTextEncoder, self).__init__()
-        self.dim = dim
-        self.dim_attn = dim_attn
-        self.dim_ffn = dim_ffn
-        self.num_heads = num_heads
-        self.num_layers = num_layers
-        self.num_buckets = num_buckets
-        self.shared_pos = shared_pos
-
-        # layers
-        self.token_embedding = vocab if isinstance(vocab, nn.Embedding) \
-            else nn.Embedding(vocab, dim)
-        self.pos_embedding = T5RelativeEmbedding(
-            num_buckets, num_heads, bidirectional=True) if shared_pos else None
-        self.dropout = nn.Dropout(dropout)
-        self.blocks = nn.ModuleList([
-            T5SelfAttention(dim, dim_attn, dim_ffn, num_heads, num_buckets,
-                            shared_pos, dropout) for _ in range(num_layers)
-        ])
-        self.norm = T5LayerNorm(dim)
-
-        # Skip costly random init when loading pretrained checkpoints.
-        # Verified: checkpoint fully covers this module (missing/unexpected keys are both 0).
-        # self.apply(init_weights)
-
-    def forward(self, ids, mask=None):
-        x = self.token_embedding(ids)
-        x = self.dropout(x)
-        e = self.pos_embedding(x.size(1),
-                               x.size(1)) if self.shared_pos else None
-        for block in self.blocks:
-            x = block(x, mask, pos_bias=e)
-        x = self.norm(x)
-        x = self.dropout(x)
-        return x
-
-
-def basic_clean(text):
-    text = ftfy.fix_text(text)
-    text = html.unescape(html.unescape(text))
-    return text.strip()
-
-
-def whitespace_clean(text):
-    text = re.sub(r'\s+', ' ', text)
-    text = text.strip()
-    return text
-
-
-def canonicalize(text, keep_punctuation_exact_string=None):
-    text = text.replace('_', ' ')
-    if keep_punctuation_exact_string:
-        text = keep_punctuation_exact_string.join(
-            part.translate(str.maketrans('', '', string.punctuation))
-            for part in text.split(keep_punctuation_exact_string))
-    else:
-        text = text.translate(str.maketrans('', '', string.punctuation))
-    text = text.lower()
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
-
-
-class HuggingfaceTokenizer:
-
-    def __init__(self, name, seq_len=None, clean=None, **kwargs):
-        assert clean in (None, 'whitespace', 'lower', 'canonicalize')
-        self.name = name
-        self.seq_len = seq_len
-        self.clean = clean
-
-        # init tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(name, **kwargs)
-        self.vocab_size = self.tokenizer.vocab_size
-
-    def __call__(self, sequence, **kwargs):
-        return_mask = kwargs.pop('return_mask', False)
-
-        # arguments
-        _kwargs = {'return_tensors': 'pt'}
-        if self.seq_len is not None:
-            _kwargs.update({
-                'padding': 'max_length',
-                'truncation': True,
-                'max_length': self.seq_len
-            })
-        _kwargs.update(**kwargs)
-
-        # tokenization
-        if isinstance(sequence, str):
-            sequence = [sequence]
-        if self.clean:
-            sequence = [self._clean(u) for u in sequence]
-        ids = self.tokenizer(sequence, **_kwargs)
-
-        # output
-        if return_mask:
-            return ids.input_ids, ids.attention_mask
-        else:
-            return ids.input_ids
-    
-    def _clean(self, text):
-        if self.clean == 'whitespace':
-            text = whitespace_clean(basic_clean(text))
-        elif self.clean == 'lower':
-            text = whitespace_clean(basic_clean(text)).lower()
-        elif self.clean == 'canonicalize':
-            text = canonicalize(basic_clean(text))
-        return text
+__all__ = [
+    "LTXTextEncoder",
+    "GEMMA_HIDDEN_SIZE",
+    "GEMMA_FEATURE_DIM",
+    "LTX_DIT_TEXT_DIM",
+    "LTX_CONNECTOR_NUM_REGISTERS",
+]
