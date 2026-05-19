@@ -1054,7 +1054,7 @@ class VideoVAE_(nn.Module):
         self._enc_feat_map = [None] * self._enc_conv_num
 
 
-class LTXVideoVAE(nn.Module):
+class _LegacyWanVideoVAE(nn.Module):
 
     def __init__(self, z_dim=16):
         super().__init__()
@@ -1253,7 +1253,7 @@ class LTXVideoVAE(nn.Module):
         return LTXVideoVAEStateDictConverter()
 
 
-class LTXVideoVAEStateDictConverter:
+class _LegacyWanVideoVAEStateDictConverter:
 
     def __init__(self):
         pass
@@ -1352,7 +1352,7 @@ class VideoVAE38_(VideoVAE_):
         return out
 
 
-class LTXVideoVAE38(LTXVideoVAE):
+class _LegacyWanVideoVAE38(_LegacyWanVideoVAE):
 
     def __init__(self, z_dim=48, dim=160):
         super(LTXVideoVAE, self).__init__()
@@ -1382,3 +1382,210 @@ class LTXVideoVAE38(LTXVideoVAE):
         self.upsampling_factor = 16
         self.temporal_downsample_factor = 4
         self.z_dim = z_dim
+
+
+# ============================================================================
+# LTX-2 VAE adapter (Task 5 / 2026-05-19)
+# ============================================================================
+# Wraps ltx-core's VideoEncoder + VideoDecoder. The legacy Wan-derived classes
+# above (_LegacyWanVideoVAE, _LegacyWanVideoVAE38, _LegacyWanVideoVAEStateDictConverter)
+# are preserved unchanged for any code that still wants them; they are not
+# used in the LTX path.
+
+from typing import Any as _Any, Dict as _Dict, List as _List, Optional as _Optional, Tuple as _Tuple, Union as _Union
+
+try:
+    import safetensors as _safetensors_lib
+    from ltx_core.model.video_vae import (
+        VideoEncoder as _VideoEncoder,
+        VideoEncoderConfigurator as _VideoEncoderConfigurator,
+        VideoDecoder as _VideoDecoder,
+        VideoDecoderConfigurator as _VideoDecoderConfigurator,
+    )
+    _LTX_VAE_OK = True
+    _LTX_VAE_ERR = None
+except Exception as _e:  # noqa: BLE001
+    _LTX_VAE_OK = False
+    _LTX_VAE_ERR = _e
+
+
+# Spatial / temporal compression for LTX-2.3 VAE (from VideoEncoder.forward
+# docstring: ``(B, 3, 33, 512, 512) -> (B, 128, 5, 16, 16)``).
+LTX_VAE_LATENT_CHANNELS = 128
+LTX_VAE_SPATIAL_STRIDE = 32      # H/32, W/32
+LTX_VAE_TEMPORAL_STRIDE = 8      # F' = 1 + (F - 1)/8
+
+
+def _filter_vae_encoder_keys(state_dict: _Dict[str, _Any]) -> _Dict[str, _Any]:
+    """Reproduce ltx_core ``VAE_ENCODER_COMFY_KEYS_FILTER``:
+    keep ``vae.encoder.*`` and ``vae.per_channel_statistics.*`` keys with prefix
+    ``vae.encoder.`` stripped (``vae.per_channel_statistics.`` renamed
+    to ``per_channel_statistics.``)."""
+    out: _Dict[str, _Any] = {}
+    for k, v in state_dict.items():
+        if k.startswith("vae.encoder."):
+            out[k[len("vae.encoder."):]] = v
+        elif k.startswith("vae.per_channel_statistics."):
+            out["per_channel_statistics." + k[len("vae.per_channel_statistics."):]] = v
+    return out
+
+
+def _filter_vae_decoder_keys(state_dict: _Dict[str, _Any]) -> _Dict[str, _Any]:
+    out: _Dict[str, _Any] = {}
+    for k, v in state_dict.items():
+        if k.startswith("vae.decoder."):
+            out[k[len("vae.decoder."):]] = v
+        elif k.startswith("vae.per_channel_statistics."):
+            out["per_channel_statistics." + k[len("vae.per_channel_statistics."):]] = v
+    return out
+
+
+class LTXVideoVAE(nn.Module):
+    """FastWAM-side adapter for LTX-2 video VAE.
+
+    Exposes FastWAM-style attributes:
+        ``z_dim``                       latent channels (128)
+        ``upsampling_factor``           spatial stride (32)
+        ``temporal_downsample_factor``  temporal stride (8)
+        ``model``                       self-alias (FastWAM accesses ``vae.model.z_dim``)
+
+    API:
+        ``encode(video, device=, tiled=False, **_) -> latent_means``
+        ``decode(latent, device=, tiled=False, **_) -> video``
+    """
+
+    def __init__(
+        self,
+        *,
+        encoder: _Optional[nn.Module] = None,
+        decoder: _Optional[nn.Module] = None,
+    ):
+        super().__init__()
+        if not _LTX_VAE_OK:
+            raise ImportError(
+                "ltx-core VAE imports failed; pip install -e third_party/ltx-2/packages/ltx-core. "
+                f"Original error: {_LTX_VAE_ERR!r}"
+            )
+        self.encoder = encoder
+        self.decoder = decoder
+        self.z_dim = LTX_VAE_LATENT_CHANNELS
+        self.upsampling_factor = LTX_VAE_SPATIAL_STRIDE
+        self.temporal_downsample_factor = LTX_VAE_TEMPORAL_STRIDE
+
+    @property
+    def model(self) -> "LTXVideoVAE":
+        # FastWAM scaffolding sometimes accesses ``vae.model.z_dim``; route it
+        # back to ourselves so existing code keeps working.
+        return self
+
+    # ----- construction from a safetensors metadata config -----------------
+    @classmethod
+    def from_config(
+        cls,
+        config: _Dict[str, _Any],
+        build_encoder: bool = True,
+        build_decoder: bool = True,
+    ) -> "LTXVideoVAE":
+        """``config`` must be the full safetensors metadata config dict
+        (with a top-level ``vae`` key, just like the on-disk format)."""
+        if not _LTX_VAE_OK:
+            raise ImportError(
+                "ltx-core VAE imports failed; pip install -e third_party/ltx-2/packages/ltx-core. "
+                f"Original error: {_LTX_VAE_ERR!r}"
+            )
+        encoder = _VideoEncoderConfigurator.from_config(config) if build_encoder else None
+        decoder = _VideoDecoderConfigurator.from_config(config) if build_decoder else None
+        return cls(encoder=encoder, decoder=decoder)
+
+    # ----- weight loading --------------------------------------------------
+    def load_pretrained_state_dict(
+        self,
+        state_dict: _Dict[str, _Any],
+        strict: bool = False,
+    ) -> _Dict[str, _Tuple[list, list]]:
+        """Filter checkpoint keys for encoder vs decoder and load each sub-module.
+
+        Returns a dict ``{"encoder": (missing, unexpected), "decoder": (...)}``
+        for each component that was actually built.
+        """
+        result: _Dict[str, _Tuple[list, list]] = {}
+        if self.encoder is not None:
+            enc_sd = _filter_vae_encoder_keys(state_dict)
+            r = self.encoder.load_state_dict(enc_sd, strict=strict)
+            result["encoder"] = (list(getattr(r, "missing_keys", [])),
+                                 list(getattr(r, "unexpected_keys", [])))
+        if self.decoder is not None:
+            dec_sd = _filter_vae_decoder_keys(state_dict)
+            r = self.decoder.load_state_dict(dec_sd, strict=strict)
+            result["decoder"] = (list(getattr(r, "missing_keys", [])),
+                                 list(getattr(r, "unexpected_keys", [])))
+        return result
+
+    def load_pretrained_safetensors(
+        self,
+        path: str,
+        strict: bool = False,
+        device: str = "cpu",
+    ) -> _Dict[str, _Tuple[list, list]]:
+        sd: _Dict[str, _Any] = {}
+        with _safetensors_lib.safe_open(path, framework="pt", device=device) as f:
+            for k in f.keys():
+                if k.startswith("vae."):
+                    sd[k] = f.get_tensor(k)
+        return self.load_pretrained_state_dict(sd, strict=strict)
+
+    # ----- FastWAM-style encode/decode -----------------------------------
+    def encode(
+        self,
+        video: _Union[torch.Tensor, _List[torch.Tensor]],
+        device: _Optional[_Union[str, torch.device]] = None,
+        tiled: bool = False,
+        tile_size: _Optional[_Tuple[int, int]] = None,
+        tile_stride: _Optional[_Tuple[int, int]] = None,
+        **_kwargs,
+    ) -> torch.Tensor:
+        """Encode pixel video to latent means.
+
+        Accepts either a (B, C, F, H, W) tensor or a list of (C, F, H, W) tensors
+        (FastWAM-style). Pixel values must already be in [-1, 1].
+        Returns latents of shape (B, 128, F', H', W').
+
+        ``tiled``/``tile_size``/``tile_stride`` are accepted for FastWAM-API
+        compatibility but currently route to the non-tiled forward; LTX has its
+        own ``TilingConfig`` interface that we can wire in later (Task 11+).
+        """
+        if self.encoder is None:
+            raise RuntimeError("LTXVideoVAE built without an encoder")
+        if isinstance(video, list):
+            video = torch.stack([v if v.ndim == 4 else v.unsqueeze(0).squeeze(0) for v in video], dim=0)
+        if device is not None:
+            video = video.to(device)
+        if tiled:
+            # Placeholder: fall back to non-tiled. Full tiled wiring will need
+            # ltx_core.model.video_vae.tiling.TilingConfig.
+            return self.encoder(video)
+        return self.encoder(video)
+
+    def decode(
+        self,
+        latent: torch.Tensor,
+        device: _Optional[_Union[str, torch.device]] = None,
+        tiled: bool = False,
+        tile_size: _Optional[_Tuple[int, int]] = None,
+        tile_stride: _Optional[_Tuple[int, int]] = None,
+        **_kwargs,
+    ) -> torch.Tensor:
+        if self.decoder is None:
+            raise RuntimeError("LTXVideoVAE built without a decoder")
+        if device is not None:
+            latent = latent.to(device)
+        return self.decoder(latent)
+
+
+__all__ = [
+    *globals().get("__all__", []),
+    "LTXVideoVAE",
+    "LTX_VAE_LATENT_CHANNELS",
+    "LTX_VAE_SPATIAL_STRIDE",
+    "LTX_VAE_TEMPORAL_STRIDE",
+]
