@@ -1,237 +1,191 @@
+"""LTX-2 video-only component loader (Task 7 / 2026-05-19).
+
+Single entry point ``load_ltx2_video_only_components`` builds + (optionally)
+weight-loads the three FastWAM-side adapters from one LTX-2.3 safetensors
+file plus a Gemma-3-12B folder. All Wan-specific plumbing (DiffSynth redirect,
+multi-shard merging, ModelConfig.download_if_necessary) is removed: LTX-2.3
+ships everything in one ``ltx-2.3-22b-dev.safetensors`` file.
+
+Weight provenance summary (see Tasks 4/5/6 for details):
+    model.diffusion_model.*  -> LTXVideoDiT (after audio key filter)
+    vae.encoder.*            -> LTXVideoVAE.encoder
+    vae.decoder.*            -> LTXVideoVAE.decoder
+    vae.per_channel_statistics.* -> per_channel_statistics.*
+    text_embedding_projection.* -> LTXTextEncoder.embeddings_processor.feature_extractor.*
+    model.diffusion_model.video_embeddings_connector.*
+                             -> LTXTextEncoder.embeddings_processor.video_connector.*
+"""
+
+from __future__ import annotations
+
+import os
+import time
 from dataclasses import dataclass
-import inspect
-from typing import Any
+from typing import Any, Dict, Optional
 
 import torch
-import time
 
-from .io import ModelConfig, hash_model_file, load_state_dict
-from .state_dict_converters import (
-    ltx_video_vae_state_dict_converter,
-)
-from ..ltx_video_dit import LTXVideoDiT
-from ..ltx_text_encoder import HuggingfaceTokenizer, LTXTextEncoder
-from ..ltx_video_vae import LTXVideoVAE
 from fastwam.utils.logging_config import get_logger
 
+from ..ltx_video_dit import LTXVideoDiT, load_ltx_config_from_safetensors
+from ..ltx_video_vae import LTXVideoVAE
+from ..ltx_text_encoder import LTXTextEncoder
+
 logger = get_logger(__name__)
+
 SKIPPED_PRETRAIN_SENTINEL = "SKIPPED_PRETRAIN"
+
+DEFAULT_LTX_CKPT_PATH = "checkpoints/Lightricks/LTX-2.3/ltx-2.3-22b-dev.safetensors"
+DEFAULT_GEMMA_PATH = "checkpoints/google/gemma-3-12b-it-qat-q4_0-unquantized"
 
 
 @dataclass
 class LTXLoadedComponents:
+    """Bundle of loaded LTX components ready to be plugged into FastWAM."""
     dit: LTXVideoDiT
     vae: LTXVideoVAE
-    text_encoder: LTXTextEncoder | None
-    tokenizer: HuggingfaceTokenizer | None
+    text_encoder: Optional[LTXTextEncoder]
+    config: Dict[str, Any]
     dit_path: str
     vae_path: str
-    text_encoder_path: str | None
-    tokenizer_path: str | None
+    text_encoder_path: Optional[str]
 
 
-WAN22_MODEL_REGISTRY = [
-    # UMT5-XXL text encoder (shared between Wan2.2-TI2V-5B and Wan2.2-A14B)
-    {
-        "model_hash": "9c8818c2cbea55eca56c7b447df170da",
-        "model_name": "ltx_text_encoder",
-        "model_class": LTXTextEncoder,
-    },
-    # Wan2.1-VAE (z_dim=16, used by Wan2.2-A14B series)
-    {
-        "model_hash": "ccc42284ea13e1ad04693284c7a09be6",
-        "model_name": "ltx_video_vae",
-        "model_class": LTXVideoVAE,
-        "model_class_kwargs": {"z_dim": 16},
-        "state_dict_converter": ltx_video_vae_state_dict_converter,
-    },
-]
-
-
-def _validate_dit_config(dit_config: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(dit_config, dict):
-        raise ValueError(f"`dit_config` must be a dict, got {type(dit_config)}")
-
-    validated = dict(dit_config)
-
-    signature = inspect.signature(LTXVideoDiT.__init__)
-    allowed_keys = set()
-    required_keys = set()
-    for name, param in signature.parameters.items():
-        if name == "self":
-            continue
-        allowed_keys.add(name)
-        if param.default is inspect.Signature.empty:
-            required_keys.add(name)
-
-    unknown_keys = sorted(set(validated) - allowed_keys)
-    if unknown_keys:
-        raise ValueError(
-            f"Unknown keys in `dit_config`: {unknown_keys}. "
-            f"Allowed keys: {sorted(allowed_keys)}"
-        )
-
-    missing_keys = sorted(required_keys - set(validated))
-    if missing_keys:
-        raise ValueError(
-            f"Missing required keys in `dit_config`: {missing_keys}. "
-            "Please specify all required LTXVideoDiT constructor args."
-        )
-
-    return validated
-
-
-def _load_registered_model(
-    path,
-    model_name: str,
-    torch_dtype: torch.dtype,
-    device: str,
-    model_kwargs_override: dict[str, Any] | None = None,
-):
-    model_hash = hash_model_file(path)
-
-    matched_config = None
-    for config in WAN22_MODEL_REGISTRY:
-        if config["model_hash"] == model_hash and config["model_name"] == model_name:
-            matched_config = config
-            break
-    if matched_config is None:
-        raise ValueError(
-            f"Cannot detect model type for {model_name}. File: {path}. "
-            f"Model hash: {model_hash}. This standalone package follows DiffSynth hash-based loading."
-        )
-
-    model_class = matched_config["model_class"]
-    model_kwargs = dict(matched_config.get("model_class_kwargs", {}))
-    model_kwargs.update(matched_config.get("extra_kwargs", {}))
-    if model_kwargs_override is not None:
-        model_kwargs.update(model_kwargs_override)
-    state_dict_converter = matched_config.get("state_dict_converter")
-
-    model = model_class(**model_kwargs)
-    state_dict = load_state_dict(path, torch_dtype=torch_dtype, device="cpu")
-    if state_dict_converter is not None:
-        state_dict = state_dict_converter(state_dict)
-
-    model.load_state_dict(state_dict, strict=False)
-    model = model.to(device=device, dtype=torch_dtype)
-    return model
-
-
-def _resolve_configs(model_id: str, tokenizer_model_id: str, redirect_common_files: bool = True):
-    dit_config = ModelConfig(model_id=model_id, origin_file_pattern="diffusion_pytorch_model*.safetensors")
-    text_config = ModelConfig(model_id=model_id, origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth")
-    vae_config = ModelConfig(model_id=model_id, origin_file_pattern="Wan2.2_VAE.pth")
-    tokenizer_config = ModelConfig(model_id=tokenizer_model_id, origin_file_pattern="google/umt5-xxl/")
-
-    if redirect_common_files:
-        redirect_dict = {
-            "models_t5_umt5-xxl-enc-bf16.pth": ("DiffSynth-Studio/Wan-Series-Converted-Safetensors", "models_t5_umt5-xxl-enc-bf16.safetensors"),
-            "Wan2.2_VAE.pth": ("DiffSynth-Studio/Wan-Series-Converted-Safetensors", "Wan2.2_VAE.safetensors"),
-        }
-        text_config.model_id, text_config.origin_file_pattern = redirect_dict[text_config.origin_file_pattern]
-        vae_config.model_id, vae_config.origin_file_pattern = redirect_dict[vae_config.origin_file_pattern]
-    return dit_config, text_config, vae_config, tokenizer_config
+def _resolve(path: str, root_hint: Optional[str] = None) -> str:
+    """Resolve a path. Accepts absolute paths verbatim; relative paths are
+    looked up under (a) cwd, (b) ``root_hint`` if provided. Raises
+    ``FileNotFoundError`` if no candidate exists."""
+    if os.path.isabs(path):
+        if not os.path.exists(path):
+            raise FileNotFoundError(path)
+        return path
+    candidates = [path]
+    if root_hint:
+        candidates.append(os.path.join(root_hint, path))
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    raise FileNotFoundError(f"could not locate {path!r}; tried: {candidates}")
 
 
 def load_ltx2_video_only_components(
+    *,
     device: str = "cuda",
     torch_dtype: torch.dtype = torch.bfloat16,
-    model_id: str = "Wan-AI/Wan2.2-T2V-A14B",
-    tokenizer_model_id: str = "Wan-AI/Wan2.2-T2V-A14B",
-    tokenizer_max_len: int = 512,
-    redirect_common_files: bool = True,
-    dit_config: dict[str, Any] | None = None,
+    ckpt_path: str = DEFAULT_LTX_CKPT_PATH,
+    gemma_path: str = DEFAULT_GEMMA_PATH,
+    load_text_encoder: bool = False,
+    attach_gemma_to_text_encoder: bool = False,
     skip_dit_load_from_pretrain: bool = False,
-    load_text_encoder: bool = True,
-):
-    """Load only the high-noise expert from Wan2.2-T2V-A14B + Wan2.1-VAE + UMT5-XXL."""
-    logger.info("Loading Wan2.2-T2V-A14B (high-noise expert) components...")
+    use_gradient_checkpointing: bool = False,
+    project_root: Optional[str] = None,
+) -> LTXLoadedComponents:
+    """Load LTX-2.3 video-only DiT + VAE (+ optional text encoder).
+
+    Args:
+        device: target torch device for the DiT and VAE. ``"cpu"`` is supported
+            (slow but useful for testing).
+        torch_dtype: model parameter dtype. ``bfloat16`` is the upstream default.
+        ckpt_path: path to ``ltx-2.3-22b-dev.safetensors`` (single-file
+            checkpoint that bundles DiT, VAE, and embeddings-connector weights).
+        gemma_path: HF-format folder for Gemma-3-12B-it. Only used when
+            ``attach_gemma_to_text_encoder=True``.
+        load_text_encoder: build LTXTextEncoder (EmbeddingsProcessor) and load
+            its weights from the same ``ckpt_path``. Note: this does *not*
+            load Gemma itself (12B weights). Pass ``attach_gemma_to_text_encoder=True``
+            to additionally bring Gemma into VRAM (only do this for cache
+            precomputation; the training loop should read pre-computed
+            embeddings from disk).
+        attach_gemma_to_text_encoder: implies ``load_text_encoder=True``.
+        skip_dit_load_from_pretrain: random-init the DiT (debug only).
+        use_gradient_checkpointing: pass-through to LTXVideoDiT.
+        project_root: if set, used as a fallback root for resolving relative
+            ``ckpt_path`` / ``gemma_path``. Typically the FastWAM_LTX repo dir.
+    """
+    if attach_gemma_to_text_encoder:
+        load_text_encoder = True
+
+    ckpt_path = _resolve(ckpt_path, project_root)
+    logger.info("Loading LTX-2.3 components from %s (device=%s, dtype=%s)",
+                ckpt_path, device, torch_dtype)
     start = time.time()
 
-    if dit_config is None:
-        raise ValueError("`dit_config` is required for Wan2.2-T2V-A14B loading.")
-    validated_dit_config = _validate_dit_config(dit_config)
+    # 1) Parse safetensors metadata once.
+    config = load_ltx_config_from_safetensors(ckpt_path)
 
-    # VAE: Wan2.1_VAE.pth at the A14B repo root (no DiffSynth redirect — safetensors not available)
-    vae_config = ModelConfig(
-        model_id=model_id,
-        origin_file_pattern="Wan2.1_VAE.pth",
-    )
-    # DiT high-noise shards: directory under model_id
-    dit_model_config = ModelConfig(
-        model_id=model_id,
-        origin_file_pattern="high_noise_model/*.safetensors",
-    )
-    # Text encoder: redirect to DiffSynth safetensors if available
-    text_config = ModelConfig(
-        model_id=model_id,
-        origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth",
-    )
-    tokenizer_config = ModelConfig(
-        model_id=tokenizer_model_id,
-        origin_file_pattern="google/umt5-xxl/",
-    )
-    if redirect_common_files:
-        text_config.model_id = "DiffSynth-Studio/Wan-Series-Converted-Safetensors"
-        text_config.origin_file_pattern = "models_t5_umt5-xxl-enc-bf16.safetensors"
-
-    vae_config.download_if_necessary()
-    if load_text_encoder:
-        text_config.download_if_necessary()
-        tokenizer_config.download_if_necessary()
-
-    # DiT: multi-shard safetensors under high_noise_model/
+    # 2) DiT
     if skip_dit_load_from_pretrain:
-        logger.info("Skipping pretrained video DiT load; random init.")
-        dit = LTXVideoDiT(**validated_dit_config).to(device=device, dtype=torch_dtype)
+        logger.info("Skipping DiT pretrained load (random init).")
+        dit = LTXVideoDiT(config=config, use_gradient_checkpointing=use_gradient_checkpointing)
+        dit = dit.to(device=device, dtype=torch_dtype)
         dit_path = SKIPPED_PRETRAIN_SENTINEL
     else:
-        dit_model_config.download_if_necessary()
-        from .state_dict_converters import ltx_video_dit_from_diffusers
-        shard_files = dit_model_config.path if isinstance(dit_model_config.path, list) else [dit_model_config.path]
-        if not shard_files:
-            raise FileNotFoundError(f"No safetensors shards found for {model_id}/high_noise_model/")
-        logger.info("Loading A14B DiT from %d shard(s): %s ...", len(shard_files), shard_files[0])
-        merged_state: dict = {}
-        for sf in shard_files:
-            sd = load_state_dict(sf, torch_dtype=torch_dtype, device="cpu")
-            merged_state.update(sd)
-        merged_state = ltx_video_dit_from_diffusers(merged_state)
-        dit = LTXVideoDiT(**validated_dit_config)
-        missing, unexpected = dit.load_state_dict(merged_state, strict=False)
-        logger.info(
-            "DiT load: missing=%d, unexpected=%d (first missing: %s)",
-            len(missing), len(unexpected), missing[:3],
+        logger.info("Building LTXVideoDiT + loading pretrained weights...")
+        dit = LTXVideoDiT(config=config, use_gradient_checkpointing=use_gradient_checkpointing)
+        dit = dit.to(dtype=torch_dtype)
+        missing, unexpected = dit.load_pretrained_safetensors(
+            ckpt_path, strict=False, device="cpu"
         )
-        dit = dit.to(device=device, dtype=torch_dtype)
-        dit_path = str(shard_files[0])
+        if missing:
+            raise RuntimeError(
+                f"LTX DiT missing {len(missing)} keys after load: {missing[:5]}"
+            )
+        if unexpected:
+            raise RuntimeError(
+                f"LTX DiT has {len(unexpected)} unexpected keys after load: {unexpected[:5]}"
+            )
+        dit = dit.to(device=device)
+        dit_path = ckpt_path
 
-    text_encoder = None
-    tokenizer = None
-    text_encoder_path = None
-    tokenizer_path = None
+    # 3) VAE (same ckpt, different prefixes)
+    logger.info("Building LTXVideoVAE + loading pretrained weights...")
+    vae = LTXVideoVAE.from_config(config, build_encoder=True, build_decoder=True)
+    vae = vae.to(dtype=torch_dtype)
+    vae_result = vae.load_pretrained_safetensors(ckpt_path, strict=False, device="cpu")
+    for sub, (m, u) in vae_result.items():
+        if m or u:
+            raise RuntimeError(
+                f"LTX VAE {sub}: missing={len(m)} ({m[:3]}), unexpected={len(u)} ({u[:3]})"
+            )
+    vae = vae.to(device=device)
+    vae_path = ckpt_path
+
+    # 4) Text encoder (optional)
+    text_encoder: Optional[LTXTextEncoder] = None
+    text_encoder_path: Optional[str] = None
     if load_text_encoder:
-        text_encoder = _load_registered_model(
-            text_config.path, "ltx_text_encoder",
-            torch_dtype=torch_dtype, device=device,
-        )
-        tokenizer = HuggingfaceTokenizer(
-            name=tokenizer_config.path,
-            seq_len=int(tokenizer_max_len),
-            clean="whitespace",
-        )
-        text_encoder_path = str(text_config.path)
-        tokenizer_path = str(tokenizer_config.path)
+        logger.info("Building LTXTextEncoder + loading EmbeddingsProcessor weights...")
+        text_encoder = LTXTextEncoder.from_config(config).to(dtype=torch_dtype)
+        m, u = text_encoder.load_pretrained_safetensors(ckpt_path, strict=False)
+        if m or u:
+            raise RuntimeError(
+                f"LTXTextEncoder: missing={len(m)} ({m[:3]}), unexpected={len(u)} ({u[:3]})"
+            )
+        text_encoder = text_encoder.to(device=device)
+        text_encoder_path = ckpt_path
+        if attach_gemma_to_text_encoder:
+            gemma_path = _resolve(gemma_path, project_root)
+            logger.info("Attaching Gemma from %s ...", gemma_path)
+            text_encoder.attach_gemma(gemma_path, torch_dtype=torch_dtype)
+            if device != "cpu":
+                text_encoder.gemma = text_encoder.gemma.to(device)
 
-    vae = _load_registered_model(
-        vae_config.path, "ltx_video_vae",
-        torch_dtype=torch_dtype, device=device,
-    )
-    logger.info("Loaded A14B high-noise components in %.2fs.", time.time() - start)
+    logger.info("Loaded LTX-2.3 components in %.1fs", time.time() - start)
     return LTXLoadedComponents(
-        dit=dit, vae=vae,
-        text_encoder=text_encoder, tokenizer=tokenizer,
-        dit_path=dit_path, vae_path=str(vae_config.path),
-        text_encoder_path=text_encoder_path, tokenizer_path=tokenizer_path,
+        dit=dit,
+        vae=vae,
+        text_encoder=text_encoder,
+        config=config,
+        dit_path=dit_path,
+        vae_path=vae_path,
+        text_encoder_path=text_encoder_path,
     )
+
+
+__all__ = [
+    "load_ltx2_video_only_components",
+    "LTXLoadedComponents",
+    "SKIPPED_PRETRAIN_SENTINEL",
+    "DEFAULT_LTX_CKPT_PATH",
+    "DEFAULT_GEMMA_PATH",
+]
