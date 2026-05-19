@@ -1,237 +1,163 @@
-import os
-import torch
-import torch.nn as nn
+"""
+LTX-isomorphic ActionDiT for FastWAM-LTX MoT.
+
+Design (post Plan-B redirect, 2026-05-19):
+  - Preserve FastWAM's two-expert MoT design (small action expert paired with
+    big LTX video DiT, joint self-attention with FastWAM mask).
+  - Drop Wan2.2-specific block internals (Wan DiTBlock with modulation/norm1/2/3,
+    Wan complex-number RoPE). Use LTX BasicAVTransformerBlock directly with
+    video.dim = hidden_dim = 1024 (smaller residual stream; inner dim still
+    matches LTX video's 4096 for joint-attention cat compatibility).
+  - Single RoPE convention (LTX SPLIT) across both streams so joint attention
+    Q.K geometry is consistent.
+
+Public API matches the dict-style pre_dit / post_dit contract used by
+fastwam.py (renamed copies live in models/ltx/fastwam.py), so the surrounding
+MoT scaffolding stays drop-in.
+"""
+
+from __future__ import annotations
+
 from typing import Any, Dict, Optional
 
-from fastwam.utils.logging_config import get_logger
+import torch
+import torch.nn as nn
 
-from .helpers.gradient import gradient_checkpoint_forward
-from .ltx_video_dit import (
-    DiTBlock,
-    sinusoidal_embedding_1d,
-    precompute_freqs_cis,
-)
+from fastwam.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
 
 
-class ActionHead(nn.Module):
-    def __init__(self, hidden_dim: int, out_dim: int, eps: float):
-        super().__init__()
-        self.norm = nn.LayerNorm(hidden_dim, eps=eps, elementwise_affine=False)
-        self.proj = nn.Linear(hidden_dim, out_dim)
-        self.modulation = nn.Parameter(torch.randn(1, 2, hidden_dim) / hidden_dim**0.5)
-
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        shift, scale = (self.modulation.to(dtype=t.dtype, device=t.device) + t.unsqueeze(1)).chunk(2, dim=1)
-        shift = shift.squeeze(1)
-        scale = scale.squeeze(1)
-        return self.proj(self.norm(x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1))
+try:
+    from ltx_core.model.transformer.adaln import AdaLayerNormSingle, adaln_embedding_coefficient
+    from ltx_core.model.transformer.rope import LTXRopeType, precompute_freqs_cis
+    from ltx_core.model.transformer.transformer import BasicAVTransformerBlock, TransformerConfig
+    _LTX_OK = True
+    _LTX_ERR = None
+except Exception as _e:  # noqa: BLE001
+    _LTX_OK = False
+    _LTX_ERR = _e
 
 
-class ActionDiT(nn.Module):
-    """ActionDiT - Wan-style DiTBlock stack used as the action expert in MoT.
+class LTXAlignedActionDiT(nn.Module):
+    """ActionDiT built from LTX primitives (BasicAVTransformerBlock with dim=hidden).
 
-For LTX video backbone integration, instantiate with:
-    hidden_dim=1024, ffn_dim=4096, num_heads=32, attn_head_dim=128,
-    num_layers=48 (must match LTX video num_layers),
-    text_dim=4096 (LTX EmbeddingsProcessor output dim).
-Inner-dim (num_heads * attn_head_dim) = 4096 matches LTX video inner_dim,
-so Q/K/V tensors can be concatenated for MoT joint self-attention.
-"""
+    Block structure is *identical* to LTX video block (so MoT helpers reuse one
+    code path for both streams), but parameter dimensions are configured to
+    keep the action expert small.
+    """
+
     ACTION_BACKBONE_SKIP_PREFIXES = ("action_encoder.", "head.")
     ACTION_BACKBONE_META_KEYS = (
         "hidden_dim",
-        "ffn_dim",
         "num_layers",
         "num_heads",
         "attn_head_dim",
         "text_dim",
-        "freq_dim",
         "eps",
     )
 
     def __init__(
         self,
-        hidden_dim: int,
+        *,
         action_dim: int,
-        ffn_dim: int,
-        text_dim: int,
-        freq_dim: int,
-        eps: float,
-        num_heads: int,
-        attn_head_dim: int,
-        num_layers: int,
+        hidden_dim: int = 1024,
+        num_heads: int = 32,
+        attn_head_dim: int = 128,
+        num_layers: int = 48,
+        text_dim: int = 4096,
+        eps: float = 1.0e-6,
+        apply_gated_attention: bool = True,
+        cross_attention_adaln: bool = True,
+        rope_type: str = "split",
+        timestep_scale_multiplier: int = 1000,
+        positional_embedding_theta: float = 10000.0,
+        use_middle_indices_grid: bool = True,
+        double_precision_rope: bool = False,
+        max_action_frames: int = 64,
         use_gradient_checkpointing: bool = False,
-    ):
+    ) -> None:
         super().__init__()
-        self.hidden_dim = hidden_dim
+        if not _LTX_OK:
+            raise ImportError(
+                "ltx-core unavailable; pip install -e third_party/ltx-2/packages/ltx-core. "
+                f"Original error: {_LTX_ERR!r}"
+            )
+        if num_heads <= 0 or attn_head_dim <= 0:
+            raise ValueError("num_heads and attn_head_dim must be positive")
+        if attn_head_dim % 2 != 0:
+            raise ValueError(f"attn_head_dim must be even for RoPE, got {attn_head_dim}")
+
         self.action_dim = action_dim
-        self.ffn_dim = ffn_dim
-        self.text_dim = text_dim
-        self.freq_dim = freq_dim
+        self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.attn_head_dim = attn_head_dim
+        self.text_dim = text_dim
+        self.eps = eps
+        self.cross_attention_adaln = cross_attention_adaln
+        self.apply_gated_attention = apply_gated_attention
+        self.timestep_scale_multiplier = timestep_scale_multiplier
+        self.positional_embedding_theta = positional_embedding_theta
+        self.use_middle_indices_grid = use_middle_indices_grid
+        self.double_precision_rope = double_precision_rope
+        self.max_action_frames = max_action_frames
 
-        if num_heads <= 0:
-            raise ValueError(f"`num_heads` must be > 0, got {num_heads}")
-        if attn_head_dim <= 0:
-            raise ValueError(f"`attn_head_dim` must be > 0, got {attn_head_dim}")
-        if attn_head_dim % 2 != 0:
-            raise ValueError(f"`attn_head_dim` must be even for RoPE, got {attn_head_dim}")
+        rope_enum = getattr(LTXRopeType, rope_type.upper()) if isinstance(rope_type, str) else rope_type
+        self.rope_type = rope_enum
 
+        # ---- input head: action vectors -> hidden ----
         self.action_encoder = nn.Linear(action_dim, hidden_dim)
-        self.text_embedding = nn.Sequential(
-            nn.Linear(text_dim, hidden_dim),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(hidden_dim, hidden_dim),
+
+        # ---- timestep AdaLN MLPs ----
+        # adaln_embedding_coefficient(cross_attention_adaln=True) = 9 in ltx-core:
+        #   3 (msa: shift/scale/gate) + 3 (mlp: shift/scale/gate) + 3 (cross-attn AdaLN)
+        coeff = adaln_embedding_coefficient(cross_attention_adaln)
+        self.adaln_single = AdaLayerNormSingle(hidden_dim, embedding_coefficient=coeff)
+        self.prompt_adaln_single = (
+            AdaLayerNormSingle(hidden_dim, embedding_coefficient=2) if cross_attention_adaln else None
         )
-        self.time_embedding = nn.Sequential(
-            nn.Linear(freq_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+
+        # ---- transformer blocks (LTX BasicAVTransformerBlock with dim=hidden_dim) ----
+        video_cfg = TransformerConfig(
+            dim=hidden_dim,
+            heads=num_heads,
+            d_head=attn_head_dim,
+            context_dim=text_dim,
+            apply_gated_attention=apply_gated_attention,
+            cross_attention_adaln=cross_attention_adaln,
         )
-        self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
         self.blocks = nn.ModuleList(
             [
-                DiTBlock(
-                    hidden_dim=hidden_dim,
-                    attn_head_dim=attn_head_dim,
-                    num_heads=num_heads,
-                    ffn_dim=ffn_dim,
-                    eps=eps,
+                BasicAVTransformerBlock(
+                    idx=i,
+                    video=video_cfg,
+                    audio=None,
+                    rope_type=self.rope_type,
+                    norm_eps=eps,
                 )
-                for _ in range(num_layers)
+                for i in range(num_layers)
             ]
         )
+        self.num_layers = num_layers
+
+        # ---- output head ----
+        # scale_shift_table for final norm; head projects back to action_dim
+        self.scale_shift_table = nn.Parameter(torch.empty(2, hidden_dim))
+        self.norm_out = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=eps)
         self.head = nn.Linear(hidden_dim, action_dim)
-        self.freqs = precompute_freqs_cis(attn_head_dim, end=1024)
+
+        # Default init for the new buffers we own (the blocks' init is handled
+        # inside ltx_core; leaving it for now).
+        nn.init.normal_(self.scale_shift_table, std=0.02)
 
         self.use_gradient_checkpointing = use_gradient_checkpointing
 
-    @classmethod
-    def backbone_key_set(cls, keys) -> set[str]:
-        return {
-            key
-            for key in keys
-            if not any(key.startswith(prefix) for prefix in cls.ACTION_BACKBONE_SKIP_PREFIXES)
-        }
+    # ----- public attribute MoT consumes -----
+    @property
+    def inner_dim(self) -> int:
+        return self.num_heads * self.attn_head_dim
 
-    @classmethod
-    def from_pretrained(
-        cls,
-        action_dit_config: dict[str, Any],
-        action_dit_pretrained_path: str | None = None,
-        skip_dit_load_from_pretrain: bool = False,
-        device: str = "cuda",
-        torch_dtype: torch.dtype = torch.bfloat16,
-    ) -> "ActionDiT":
-        if action_dit_config is None:
-            raise ValueError("`action_dit_config` is required for ActionDiT.from_pretrained().")
-        if skip_dit_load_from_pretrain:
-            logger.info(
-                "Skipping ActionDiT pretrained load (`skip_dit_load_from_pretrain=True`); "
-                "initializing action expert randomly and expecting checkpoint override."
-            )
-            return cls(**action_dit_config).to(device=device, dtype=torch_dtype)
-        if not action_dit_pretrained_path:
-            logger.info("No `action_dit_pretrained_path` provided, initializing ActionDiT with random weights.")
-            return cls(**action_dit_config).to(device=device, dtype=torch_dtype)
-        from pathlib import Path
-        p = Path(action_dit_pretrained_path)
-        if not p.is_absolute():
-            p = Path(__file__).resolve().parents[4] / p
-        action_dit_pretrained_path = str(p)
-        if not os.path.isfile(action_dit_pretrained_path):
-            raise FileNotFoundError(
-                f"`action_dit_pretrained_path` does not exist: {action_dit_pretrained_path}"
-            )
-
-        action_cfg = dict(action_dit_config)
-        action_expert = cls(**action_cfg).to(device=device, dtype=torch_dtype)
-        action_state = action_expert.state_dict()
-        expected_backbone_keys = cls.backbone_key_set(action_state.keys())
-
-        payload = torch.load(action_dit_pretrained_path, map_location="cpu")
-        if not isinstance(payload, dict):
-            raise ValueError(
-                f"Invalid action backbone payload type from {action_dit_pretrained_path}: {type(payload)}"
-            )
-        
-        policy = payload.get("policy", {})
-        if policy:
-            logger.info(f"ActionDiT backbone payload policy: {policy}")
-
-        meta = payload.get("meta")
-        expected_meta = {
-            "hidden_dim": int(action_cfg["hidden_dim"]),
-            "ffn_dim": int(action_cfg["ffn_dim"]),
-            "num_layers": int(action_cfg["num_layers"]),
-            "num_heads": int(action_cfg["num_heads"]),
-            "attn_head_dim": int(action_cfg["attn_head_dim"]),
-            "text_dim": int(action_cfg["text_dim"]),
-            "freq_dim": int(action_cfg["freq_dim"]),
-            "eps": float(action_cfg["eps"]),
-        }
-        for key in cls.ACTION_BACKBONE_META_KEYS:
-            if key not in meta:
-                raise ValueError(f"`meta.{key}` missing in {action_dit_pretrained_path}")
-            expected_value = expected_meta[key]
-            got_value = meta[key]
-            if key == "eps":
-                if abs(float(got_value) - float(expected_value)) > 1e-12:
-                    raise ValueError(
-                        f"`meta.{key}` mismatch in {action_dit_pretrained_path}: "
-                        f"expected {expected_value}, got {got_value}"
-                    )
-            elif int(got_value) != int(expected_value):
-                raise ValueError(
-                    f"`meta.{key}` mismatch in {action_dit_pretrained_path}: "
-                    f"expected {expected_value}, got {got_value}"
-                )
-
-        backbone_state_dict = payload.get("backbone_state_dict")
-        if not isinstance(backbone_state_dict, dict):
-            raise ValueError(
-                f"`backbone_state_dict` must be a dict in {action_dit_pretrained_path}, "
-                f"got {type(backbone_state_dict)}"
-            )
-
-        provided_keys = set(backbone_state_dict.keys())
-        missing_keys = sorted(expected_backbone_keys - provided_keys)
-        unexpected_keys = sorted(provided_keys - expected_backbone_keys)
-        if missing_keys or unexpected_keys:
-            raise ValueError(
-                "Action backbone key mismatch in preprocessed payload. "
-                f"missing={missing_keys[:10]}{'...' if len(missing_keys) > 10 else ''}, "
-                f"unexpected={unexpected_keys[:10]}{'...' if len(unexpected_keys) > 10 else ''}"
-            )
-
-        merged_state = dict(action_state)
-        for key in expected_backbone_keys:
-            value = backbone_state_dict[key]
-            if not isinstance(value, torch.Tensor):
-                raise ValueError(
-                    f"`backbone_state_dict[{key}]` must be torch.Tensor in {action_dit_pretrained_path}, "
-                    f"got {type(value)}"
-                )
-            target = merged_state[key]
-            if tuple(value.shape) != tuple(target.shape):
-                raise ValueError(
-                    f"Shape mismatch for `{key}` in {action_dit_pretrained_path}: "
-                    f"expected {tuple(target.shape)}, got {tuple(value.shape)}"
-                )
-            merged_state[key] = value.to(device=target.device, dtype=target.dtype)
-
-        action_expert.load_state_dict(merged_state, strict=True)
-        logger.info(
-            "Loaded ActionDiT backbone from %s (keys=%d; random_kept_prefixes=%s).",
-            action_dit_pretrained_path,
-            len(expected_backbone_keys),
-            list(cls.ACTION_BACKBONE_SKIP_PREFIXES),
-        )
-        return action_expert.to(device=device, dtype=torch_dtype)
-
+    # ----- pre_dit / post_dit: FastWAM-side contract -----
     def pre_dit(
         self,
         action_tokens: torch.Tensor,
@@ -239,108 +165,143 @@ so Q/K/V tensors can be concatenated for MoT joint self-attention.
         context: torch.Tensor,
         context_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
+        """Build the per-block ingredients MoT needs.
+
+        Args:
+            action_tokens: (B, T, action_dim) noisy action tokens.
+            timestep: (B,) batch-shared sigma.
+            context: (B, T_text, text_dim) text embeddings (already in
+                LTX cross-attn dim; we don't reproject).
+            context_mask: (B, T_text) binary mask, 1 for valid tokens.
+
+        Returns a dict with keys: tokens, freqs, t_mod, embedded_timestep,
+        context, context_mask, scale_shift_table, meta. MoT helpers read this
+        dict the same way they read video_expert.pre_dit's output.
+        """
         if action_tokens.ndim != 3:
-            raise ValueError(
-                f"`action_tokens` must be 3D [B, T, action_dim], got shape {tuple(action_tokens.shape)}"
-            )
-        if action_tokens.shape[2] != self.action_dim:
-            raise ValueError(
-                f"`action_tokens` last dim must be {self.action_dim}, got {action_tokens.shape[2]}"
-            )
-        if timestep.ndim != 1:
-            raise ValueError(f"`timestep` must be 1D [B] or [1], got shape {tuple(timestep.shape)}")
-        if context.ndim != 3:
-            raise ValueError(
-                f"`context` must be 3D [B, L, D], got shape {tuple(context.shape)}"
-            )
+            raise ValueError(f"action_tokens must be 3D (B,T,action_dim); got {tuple(action_tokens.shape)}")
+        B, T, _ = action_tokens.shape
+        device = action_tokens.device
+        dtype = action_tokens.dtype
 
-        batch_size = action_tokens.shape[0]
-        if context.shape[0] != batch_size:
-            raise ValueError(
-                f"Batch mismatch between action tokens and text context: {batch_size} vs {context.shape[0]}"
-            )
-        if timestep.shape[0] not in (1, batch_size):
-            raise ValueError(
-                f"`timestep` length must be 1 or batch_size({batch_size}), got {timestep.shape[0]}"
-            )
-        if timestep.shape[0] == 1 and batch_size > 1:
-            if self.training:
-                raise ValueError("During training, action timestep length must match batch_size.")
-            timestep = timestep.expand(batch_size)
+        # 1) Embed action vectors to hidden_dim
+        x = self.action_encoder(action_tokens)  # (B, T, hidden)
 
-        if context_mask is None:
-            context_mask = torch.ones(
-                (batch_size, context.shape[1]), dtype=torch.bool, device=context.device
-            )
-        else:
-            if context_mask.ndim != 2:
-                raise ValueError(f"`context_mask` must be 2D [B, L], got shape {tuple(context_mask.shape)}")
-            if context_mask.shape[0] != batch_size or context_mask.shape[1] != context.shape[1]:
-                raise ValueError(
-                    f"`context_mask` shape must match `context` shape [B, L], got {tuple(context_mask.shape)} vs {tuple(context.shape)}"
-                )
+        # 2) Build positions for LTX 3D RoPE: action token i has temporal index i,
+        # height=0, width=0 (action lives on the temporal axis only).
+        i_idx = torch.arange(T, device=device, dtype=torch.float32)
+        zero = torch.zeros(T, device=device, dtype=torch.float32)
+        positions = torch.stack([i_idx, zero, zero], dim=0)  # (3, T)
+        positions = positions.unsqueeze(0).expand(B, -1, -1).contiguous()      # (B, 3, T)
+        positions = positions.unsqueeze(-1).expand(-1, -1, -1, 2).contiguous() # (B, 3, T, 2)
 
-        seq_len = action_tokens.shape[1]
-        if seq_len > self.freqs.shape[0]:
-            raise ValueError(
-                f"Action token length {seq_len} exceeds RoPE cache {self.freqs.shape[0]}."
-            )
+        # 3) RoPE freqs via LTX precompute_freqs_cis (same machinery as LTX video).
+        # max_pos: action lives only on temporal axis, so [max_action_frames, 1, 1].
+        from ltx_core.model.transformer.rope import (
+            generate_freq_grid_np,
+            generate_freq_grid_pytorch,
+        )
+        freq_grid_generator = generate_freq_grid_np if self.double_precision_rope else generate_freq_grid_pytorch
+        pe = precompute_freqs_cis(
+            indices_grid=positions,
+            dim=self.inner_dim,
+            out_dtype=dtype,
+            theta=self.positional_embedding_theta,
+            max_pos=[max(self.max_action_frames, T), 1, 1],
+            use_middle_indices_grid=self.use_middle_indices_grid,
+            num_attention_heads=self.num_heads,
+            rope_type=self.rope_type,
+            freq_grid_generator=freq_grid_generator,
+        )
 
-        t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep))
-        t_mod = self.time_projection(t).unflatten(1, (6, self.hidden_dim))
+        # 4) Timestep embedding via adaln_single (matches LTX video's setup).
+        if timestep.ndim == 0:
+            timestep = timestep.expand(B)
+        timestep_scaled = timestep * self.timestep_scale_multiplier
+        t_mod_flat, embedded_timestep = self.adaln_single(
+            timestep_scaled.flatten(), hidden_dtype=dtype
+        )
+        # Reshape to (B, 1, coeff*hidden) so block's get_ada_values can split.
+        t_mod = t_mod_flat.view(B, -1, t_mod_flat.shape[-1])
+        embedded_timestep = embedded_timestep.view(B, -1, embedded_timestep.shape[-1])
 
-        tokens = self.action_encoder(action_tokens)
-        context_emb = self.text_embedding(context)
-        context_attn_mask = context_mask.unsqueeze(1).expand(-1, seq_len, -1)
-        freqs = self.freqs[:seq_len].view(seq_len, 1, -1).to(tokens.device)
+        # 5) Cross-attn AdaLN prompt timestep (if enabled)
+        prompt_timestep = None
+        if self.prompt_adaln_single is not None:
+            sigma = timestep  # use same sigma for now
+            p_flat, _ = self.prompt_adaln_single(sigma.flatten(), hidden_dtype=dtype)
+            prompt_timestep = p_flat.view(B, -1, p_flat.shape[-1])
 
         return {
-            "tokens": tokens,
-            "freqs": freqs,
-            "t": t,
+            "tokens": x,
+            "freqs": pe,
             "t_mod": t_mod,
-            "context": context_emb,
-            "context_mask": context_attn_mask,
+            "embedded_timestep": embedded_timestep,
+            "prompt_timestep": prompt_timestep,
+            "context": context,
+            "context_mask": context_mask,
             "meta": {
-                "batch_size": batch_size,
-                "seq_len": seq_len,
+                "T": T,
+                "B": B,
+                "hidden_dim": self.hidden_dim,
+                "inner_dim": self.inner_dim,
+                "num_action_frames": T,
             },
         }
 
-    def post_dit(self, tokens: torch.Tensor, pre_state: Dict[str, Any]) -> torch.Tensor:
-        return self.head(tokens)
-
-    def forward(
-        self,
-        action_tokens: torch.Tensor,
-        timestep: torch.Tensor,
-        context: torch.Tensor,
-        context_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        pre_state = self.pre_dit(
-            action_tokens=action_tokens,
-            timestep=timestep,
-            context=context,
-            context_mask=context_mask,
+    def post_dit(self, tokens_out: torch.Tensor, pre_state: Dict[str, Any]) -> torch.Tensor:
+        """Apply final scale_shift + norm + head. Returns (B, T, action_dim)."""
+        embedded_timestep = pre_state["embedded_timestep"]
+        scale_shift = (
+            self.scale_shift_table[None, None].to(device=tokens_out.device, dtype=tokens_out.dtype)
+            + embedded_timestep[:, :, None]
         )
-        x = pre_state["tokens"]
-        context = pre_state["context"]
-        t_mod = pre_state["t_mod"]
-        freqs = pre_state["freqs"]
-        context_mask = pre_state["context_mask"]
+        shift, scale = scale_shift[:, :, 0], scale_shift[:, :, 1]
+        x = self.norm_out(tokens_out)
+        x = x * (1 + scale) + shift
+        return self.head(x)
 
-        for block in self.blocks:
-            if self.use_gradient_checkpointing:
-                x = gradient_checkpoint_forward(
-                    block,
-                    self.use_gradient_checkpointing,
-                    x,
-                    context,
-                    t_mod,
-                    freqs,
-                    context_mask=context_mask,
-                )
-            else:
-                x = block(x, context, t_mod, freqs, context_mask=context_mask)
+    # ----- preferred construction path used by fastwam.py -----
+    @classmethod
+    def from_pretrained(
+        cls,
+        action_dit_config: Dict[str, Any],
+        action_dit_pretrained_path: Optional[str] = None,
+        skip_dit_load_from_pretrain: bool = False,
+        device: str = "cuda",
+        torch_dtype: torch.dtype = torch.bfloat16,
+    ) -> "LTXAlignedActionDiT":
+        if not action_dit_config:
+            raise ValueError("`action_dit_config` is required for LTXAlignedActionDiT.from_pretrained")
+        model = cls(**action_dit_config).to(device=device, dtype=torch_dtype)
+        if skip_dit_load_from_pretrain or not action_dit_pretrained_path:
+            if not skip_dit_load_from_pretrain:
+                logger.info("No action_dit_pretrained_path; ActionDiT initialized randomly.")
+            return model
 
-        return self.post_dit(x, pre_state)
+        # Load alpha-scale init payload (Task 10 will produce this).
+        from pathlib import Path
+        p = Path(action_dit_pretrained_path)
+        if not p.is_absolute():
+            p = Path(__file__).resolve().parents[4] / p
+        if not p.is_file():
+            raise FileNotFoundError(f"action_dit_pretrained_path not found: {p}")
+        payload = torch.load(str(p), map_location="cpu")
+        if "backbone_state_dict" not in payload:
+            raise ValueError(f"payload missing backbone_state_dict: {p}")
+        missing, unexpected = model.load_state_dict(payload["backbone_state_dict"], strict=False)
+        logger.info(
+            "LTXAlignedActionDiT load: missing=%d, unexpected=%d (first missing: %s)",
+            len(missing), len(unexpected), missing[:3],
+        )
+        return model
+
+    # ----- helpers used by Task 10 preprocess script -----
+    @classmethod
+    def backbone_key_set(cls, keys):
+        return {k for k in keys if not any(k.startswith(p) for p in cls.ACTION_BACKBONE_SKIP_PREFIXES)}
+
+
+__all__ = [
+    "LTXAlignedActionDiT",
+]
