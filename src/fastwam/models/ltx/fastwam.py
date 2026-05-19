@@ -473,6 +473,7 @@ class FastWAM(torch.nn.Module):
             dtype=input_latents.dtype,
         )
         latents = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)
+        sigma_video = timestep_video / float(max(self.train_video_scheduler.num_train_timesteps, 1))
         target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)
 
         if inputs["first_frame_latents"] is not None:
@@ -485,11 +486,12 @@ class FastWAM(torch.nn.Module):
             dtype=action.dtype,
         )
         noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
+        sigma_action = timestep_action / float(max(self.train_action_scheduler.num_train_timesteps, 1))
         target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
 
         video_pre = self.video_expert.pre_dit(
             x=latents,
-            timestep=timestep_video,
+            timestep=sigma_video,
             context=context,
             context_mask=context_mask,
             action=action,
@@ -498,7 +500,7 @@ class FastWAM(torch.nn.Module):
 
         action_pre = self.action_expert.pre_dit(
             action_tokens=noisy_action,
-            timestep=timestep_action,
+            timestep=sigma_action,
             context=context,
             context_mask=context_mask,
         )
@@ -594,9 +596,11 @@ class FastWAM(torch.nn.Module):
         fuse_vae_embedding_in_latents: bool,
         gt_action: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        sigma_video = timestep_video / float(max(self.infer_video_scheduler.num_train_timesteps, 1))
+        sigma_action = timestep_action / float(max(self.infer_action_scheduler.num_train_timesteps, 1))
         video_pre = self.video_expert.pre_dit(
             x=latents_video,
-            timestep=timestep_video,
+            timestep=sigma_video,
             context=context,
             context_mask=context_mask,
             action=gt_action,
@@ -604,7 +608,7 @@ class FastWAM(torch.nn.Module):
         )
         action_pre = self.action_expert.pre_dit(
             action_tokens=latents_action,
-            timestep=timestep_action,
+            timestep=sigma_action,
             context=context,
             context_mask=context_mask,
         )
@@ -669,9 +673,10 @@ class FastWAM(torch.nn.Module):
             action=None,
             fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
         )
+        sigma_action = timestep_action / float(max(self.infer_action_scheduler.num_train_timesteps, 1))
         action_pre = self.action_expert.pre_dit(
             action_tokens=latents_action,
-            timestep=timestep_action,
+            timestep=sigma_action,
             context=context,
             context_mask=context_mask,
         )
@@ -725,9 +730,10 @@ class FastWAM(torch.nn.Module):
         attention_mask: torch.Tensor,
         video_seq_len: int,
     ) -> torch.Tensor:
+        sigma_action = timestep_action / float(max(self.infer_action_scheduler.num_train_timesteps, 1))
         action_pre = self.action_expert.pre_dit(
             action_tokens=latents_action,
-            timestep=timestep_action,
+            timestep=sigma_action,
             context=context,
             context_mask=context_mask,
         )
