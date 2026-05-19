@@ -201,7 +201,10 @@ class MoTBlock(nn.Module):
         expert_use_gc_action: bool,
     ) -> None:
         super().__init__()
-        self._mot_ref = mot  # *not* registered as a submodule; we use weakref-style access
+        # Stash via object.__setattr__ so nn.Module.__setattr__ does NOT register
+        # `mot` as a submodule — otherwise MoT -> MoTBlock -> mot creates a cycle
+        # that breaks `.to(device)` with infinite recursion.
+        object.__setattr__(self, "_mot_ref", mot)
         self.video_block = video_block
         self.action_block = action_block
         self.do_ckpt = bool(do_ckpt)

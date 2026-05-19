@@ -41,11 +41,11 @@ def _mixed_precision_to_model_dtype(mixed_precision: str) -> torch.dtype:
 
 
 def create_fastwam(
-    model_id: str,
-    tokenizer_model_id: str,
     video_dit_config,
-    tokenizer_max_len: int = 512,
-    load_text_encoder: bool = True,
+    ckpt_path: str = "checkpoints/Lightricks/LTX-2.3/ltx-2.3-22b-dev.safetensors",
+    gemma_path: str = "checkpoints/google/gemma-3-12b-it",
+    load_text_encoder: bool = False,
+    attach_gemma_to_text_encoder: bool = False,
     proprio_dim: int | None = None,
     action_dit_config=None,
     action_dit_pretrained_path: str | None = None,
@@ -55,11 +55,10 @@ def create_fastwam(
     loss=None,
     mot_checkpoint_mixed_attn: bool = True,
     mot_checkpoint_stride: int = 1,
-    redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):
-    from .models.wan22.fastwam import FastWAM
+    from .models.ltx.fastwam import FastWAM
 
     if isinstance(video_dit_config, DictConfig):
         video_dit_config = OmegaConf.to_container(video_dit_config, resolve=True)
@@ -101,15 +100,14 @@ def create_fastwam(
     if not isinstance(loss, dict):
         raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
 
-    return FastWAM.from_a14b_high_noise_pretrained(
+    return FastWAM.from_ltx_video_only_pretrained(
         device=device,
         torch_dtype=model_dtype,
-        model_id=model_id,
-        tokenizer_model_id=tokenizer_model_id,
-        tokenizer_max_len=int(tokenizer_max_len),
+        ckpt_path=str(ckpt_path),
+        gemma_path=str(gemma_path),
         load_text_encoder=bool(load_text_encoder),
+        attach_gemma_to_text_encoder=bool(attach_gemma_to_text_encoder),
         proprio_dim=(None if proprio_dim is None else int(proprio_dim)),
-        redirect_common_files=bool(redirect_common_files),
         video_dit_config=video_dit_config,
         action_dit_config=action_dit_config,
         action_dit_pretrained_path=action_dit_pretrained_path,

@@ -7,7 +7,7 @@ from PIL import Image
 
 from fastwam.utils.logging_config import get_logger
 
-from .action_dit import ActionDiT
+from .action_dit import LTXAlignedActionDiT as ActionDiT
 from .helpers.loader import load_ltx2_video_only_components
 from .mot import MoT
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
@@ -25,7 +25,6 @@ class FastWAM(torch.nn.Module):
         mot: MoT,
         vae,
         text_encoder=None,
-        tokenizer=None,
         text_dim: Optional[int] = None,
         proprio_dim: Optional[int] = None,
         device: str = "cpu",
@@ -51,11 +50,10 @@ class FastWAM(torch.nn.Module):
 
         self.vae = vae
         self.text_encoder = text_encoder
-        self.tokenizer = tokenizer
         if text_dim is None:
             if self.text_encoder is None:
                 raise ValueError("`text_dim` is required when `text_encoder` is not loaded.")
-            text_dim = int(self.text_encoder.dim)
+            text_dim = int(self.text_encoder.dit_text_dim)
         self.text_dim = int(text_dim)
         self.proprio_dim = None if proprio_dim is None else int(proprio_dim)
         if self.proprio_dim is not None:
@@ -110,12 +108,11 @@ class FastWAM(torch.nn.Module):
         cls,
         device: str = "cuda",
         torch_dtype: torch.dtype = torch.bfloat16,
-        model_id: str = "Wan-AI/Wan2.2-TI2V-5B",
-        tokenizer_model_id: str = "Wan-AI/Wan2.1-T2V-1.3B",
-        tokenizer_max_len: int = 512,
-        load_text_encoder: bool = True,
+        ckpt_path: str = "checkpoints/Lightricks/LTX-2.3/ltx-2.3-22b-dev.safetensors",
+        gemma_path: str = "checkpoints/google/gemma-3-12b-it",
+        load_text_encoder: bool = False,
+        attach_gemma_to_text_encoder: bool = False,
         proprio_dim: Optional[int] = None,
-        redirect_common_files: bool = True,
         video_dit_config: dict[str, Any] | None = None,
         action_dit_config: dict[str, Any] | None = None,
         action_dit_pretrained_path: str | None = None,
@@ -134,20 +131,17 @@ class FastWAM(torch.nn.Module):
         loss_lambda_action: float = 1.0,
     ):
         if video_dit_config is None:
-            raise ValueError("`video_dit_config` is required for FastWAM.from_ltx_video_only_pretrained().")
-        if "text_dim" not in video_dit_config:
-            raise ValueError("`video_dit_config['text_dim']` is required for FastWAM.")
+            video_dit_config = {}
 
         components = load_ltx2_video_only_components(
             device=device,
             torch_dtype=torch_dtype,
-            model_id=model_id,
-            tokenizer_model_id=tokenizer_model_id,
-            tokenizer_max_len=tokenizer_max_len,
-            redirect_common_files=redirect_common_files,
-            dit_config=video_dit_config,
-            skip_dit_load_from_pretrain=skip_dit_load_from_pretrain,
+            ckpt_path=ckpt_path,
+            gemma_path=gemma_path,
             load_text_encoder=load_text_encoder,
+            attach_gemma_to_text_encoder=attach_gemma_to_text_encoder,
+            skip_dit_load_from_pretrain=skip_dit_load_from_pretrain,
+            use_gradient_checkpointing=bool(video_dit_config.get("use_gradient_checkpointing", False)),
         )
 
         video_expert = components.dit
@@ -177,8 +171,7 @@ class FastWAM(torch.nn.Module):
             mot=mot,
             vae=components.vae,
             text_encoder=components.text_encoder,
-            tokenizer=components.tokenizer,
-            text_dim=int(video_dit_config["text_dim"]),
+            text_dim=int(video_dit_config.get("text_dim", 4096)),
             proprio_dim=proprio_dim,
             device=device,
             torch_dtype=torch_dtype,
@@ -197,7 +190,6 @@ class FastWAM(torch.nn.Module):
             "video_dit": components.dit_path,
             "vae": components.vae_path,
             "text_encoder": components.text_encoder_path,
-            "tokenizer": components.tokenizer_path,
             "action_dit_backbone": (
                 "SKIPPED_PRETRAIN" if skip_dit_load_from_pretrain else action_dit_pretrained_path
             ),
@@ -213,32 +205,26 @@ class FastWAM(torch.nn.Module):
         return self
 
     @staticmethod
-    def _check_resize_height_width(height, width, num_frames, spatial_stride: int = 16):
+    def _check_resize_height_width(height, width, num_frames, spatial_stride: int = 32, temporal_stride: int = 8):
         if height % spatial_stride != 0:
             height = (height + spatial_stride - 1) // spatial_stride * spatial_stride
         if width % spatial_stride != 0:
             width = (width + spatial_stride - 1) // spatial_stride * spatial_stride
-        if num_frames % 4 != 1:
-            num_frames = (num_frames + 3) // 4 * 4 + 1
+        if (num_frames - 1) % temporal_stride != 0:
+            num_frames = ((num_frames - 1 + temporal_stride - 1) // temporal_stride) * temporal_stride + 1
         return height, width, num_frames
 
     @torch.no_grad()
     def encode_prompt(self, prompt: Union[str, Sequence[str]]):
-        if self.text_encoder is None or self.tokenizer is None:
+        if self.text_encoder is None:
             raise ValueError(
-                "Prompt encoding requires loaded text encoder/tokenizer. "
-                "Set `load_text_encoder=true` or provide precomputed `context/context_mask`."
+                "Prompt encoding requires loaded LTXTextEncoder (with Gemma attached). "
+                "Either set `load_text_encoder=true` and `attach_gemma_to_text_encoder=true`, "
+                "or provide precomputed `context/context_mask` from the cache."
             )
-        ids, mask = self.tokenizer(prompt, return_mask=True, add_special_tokens=True)
-        ids = ids.to(self.device)
-        mask = mask.to(self.device, dtype=torch.bool)
-        prompt_emb = self.text_encoder(ids, mask)
-        # FIXME: original implementation's zero padding is visible in cross-attn.
-        seq_lens = mask.gt(0).sum(dim=1).long()
-        for i, v in enumerate(seq_lens):
-            prompt_emb[i, v:] = 0
-        mask = torch.ones_like(mask)
-        return prompt_emb.to(device=self.device), mask
+        prompts = [prompt] if isinstance(prompt, str) else list(prompt)
+        prompt_emb, binary_mask = self.text_encoder.encode(prompts, device=self.device)
+        return prompt_emb.to(device=self.device, dtype=self.torch_dtype), binary_mask.to(device=self.device, dtype=torch.bool)
 
     def _append_proprio_to_context(
         self,
@@ -318,8 +304,8 @@ class FastWAM(torch.nn.Module):
             raise ValueError(
                 f"Video spatial dims must be multiples of {spatial_stride} (VAE stride), got H={height}, W={width}"
             )
-        if num_frames % 4 != 1:
-            raise ValueError(f"Video T must satisfy T % 4 == 1, got T={num_frames}")
+        if (num_frames - 1) % 8 != 0:
+            raise ValueError(f"Video T must satisfy (T-1) % 8 == 0 (LTX VAE temporal stride), got T={num_frames}")
         if num_frames <= 1:
             raise ValueError(f"Video T must be > 1 for action-conditioned training, got T={num_frames}")
 
@@ -550,6 +536,10 @@ class FastWAM(torch.nn.Module):
                 "video": video_pre["t_mod"],
                 "action": action_pre["t_mod"],
             },
+            prompt_timestep_all={
+                "video": video_pre.get("prompt_timestep"),
+                "action": action_pre.get("prompt_timestep"),
+            },
         )
 
         pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
@@ -650,6 +640,10 @@ class FastWAM(torch.nn.Module):
                 "video": video_pre["t_mod"],
                 "action": action_pre["t_mod"],
             },
+            prompt_timestep_all={
+                "video": video_pre.get("prompt_timestep"),
+                "action": action_pre.get("prompt_timestep"),
+            },
         )
 
         pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
@@ -711,6 +705,10 @@ class FastWAM(torch.nn.Module):
             t_mod_all={
                 "video": video_pre["t_mod"],
                 "action": action_pre["t_mod"],
+            },
+            prompt_timestep_all={
+                "video": video_pre.get("prompt_timestep"),
+                "action": action_pre.get("prompt_timestep"),
             },
         )
         pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)

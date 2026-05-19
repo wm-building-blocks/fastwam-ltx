@@ -470,6 +470,7 @@ class _LegacyWanLikeDiT(torch.nn.Module):
             timestep = timestep.expand(batch_size)
         return x, timestep, context_mask
 
+
     def build_video_to_video_mask(
         self,
         video_seq_len: int,
@@ -829,6 +830,14 @@ class LTXVideoDiT(torch.nn.Module):
         # Alias so MoT / preprocess scripts can iterate `model.blocks`.
         self.blocks = self._inner.transformer_blocks
 
+        # FastWAM-compat attributes consumed by fastwam.py / trainer.
+        self.video_attention_mask_mode: str = str(
+            tcfg.get("video_attention_mask_mode", "first_frame_causal")
+        )
+        self.fuse_vae_embedding_in_latents: bool = False
+        self.action_conditioned: bool = False
+        self.ffn_dim: int = int(tcfg.get("caption_channels", self.hidden_dim * 4))
+
         self.use_gradient_checkpointing = use_gradient_checkpointing
         if use_gradient_checkpointing:
             self._inner.set_gradient_checkpointing(True)
@@ -1001,6 +1010,58 @@ class LTXVideoDiT(torch.nn.Module):
         # (B, T, C) -> (B, C, F, H, W)
         x_5d = x.transpose(1, 2).reshape(B, -1, F, H, W).contiguous()
         return x_5d
+
+    # -- FastWAM-compat shim ---------------------------------------------------
+    def pre_dit(
+        self,
+        x: torch.Tensor,
+        timestep: torch.Tensor,
+        context: torch.Tensor,
+        context_mask=None,
+        action=None,
+        fuse_vae_embedding_in_latents: bool = False,
+        video_self_attention_mask=None,
+    ):
+        """FastWAM-style dict wrapper around `prepare(...)`."""
+        if fuse_vae_embedding_in_latents:
+            raise ValueError(
+                "LTXVideoDiT does not support fuse_vae_embedding_in_latents; "
+                "first-frame conditioning is handled by latents[:, :, 0:1] overwrite."
+            )
+        # LTX preprocessor expects integer mask (1=valid, 0=pad). Accept bool/float.
+        if context_mask is not None and context_mask.dtype != torch.long:
+            context_mask = context_mask.to(torch.long)
+        video_args, meta = self.prepare(
+            latent_5d=x,
+            sigma=timestep,
+            context=context,
+            context_mask=context_mask,
+            video_self_attention_mask=video_self_attention_mask,
+        )
+        return {
+            "tokens": video_args.x,
+            "freqs": video_args.positional_embeddings,
+            "t_mod": video_args.timesteps,
+            "embedded_timestep": video_args.embedded_timestep,
+            "prompt_timestep": getattr(video_args, "prompt_timestep", None),
+            "context": video_args.context,
+            "context_mask": video_args.context_mask,
+            "meta": meta,
+            "video_args": video_args,
+        }
+
+    def post_dit(self, tokens_out: torch.Tensor, pre_state) -> torch.Tensor:
+        """FastWAM-style wrapper around `postprocess(...)`.
+
+        ``TransformerArgs`` is a frozen dataclass, so we use
+        ``dataclasses.replace`` to swap in the post-block tokens before
+        invoking the LTX final norm/projection path.
+        """
+        import dataclasses as _dc
+        video_args = pre_state["video_args"]
+        meta = pre_state["meta"]
+        video_args = _dc.replace(video_args, x=tokens_out)
+        return self.postprocess(video_args, meta)
 
     def build_video_to_video_mask(
         self,
