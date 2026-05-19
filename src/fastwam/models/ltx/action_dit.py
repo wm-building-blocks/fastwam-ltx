@@ -30,6 +30,15 @@ class ActionHead(nn.Module):
 
 
 class ActionDiT(nn.Module):
+    """ActionDiT - Wan-style DiTBlock stack used as the action expert in MoT.
+
+For LTX video backbone integration, instantiate with:
+    hidden_dim=1024, ffn_dim=4096, num_heads=32, attn_head_dim=128,
+    num_layers=48 (must match LTX video num_layers),
+    text_dim=4096 (LTX EmbeddingsProcessor output dim).
+Inner-dim (num_heads * attn_head_dim) = 4096 matches LTX video inner_dim,
+so Q/K/V tensors can be concatenated for MoT joint self-attention.
+"""
     ACTION_BACKBONE_SKIP_PREFIXES = ("action_encoder.", "head.")
     ACTION_BACKBONE_META_KEYS = (
         "hidden_dim",
