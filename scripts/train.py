@@ -1,3 +1,17 @@
+# faulthandler: when SIGSEGV/SIGFPE/SIGABRT/SIGBUS fires, dump every thread's
+# Python + C stack to stderr before the process dies. Zero overhead while
+# running; gives a traceback when a native crash (NCCL, CUDA, decode) would
+# otherwise leave no Python stack. SIGUSR1 dumps without killing (debug hangs).
+import faulthandler
+import signal
+import sys
+
+faulthandler.enable(file=sys.stderr, all_threads=True)
+try:
+    faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True, chain=False)
+except (AttributeError, ValueError):
+    pass
+
 import hydra
 from omegaconf import DictConfig
 

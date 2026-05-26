@@ -11,6 +11,7 @@ from .action_dit import LTXAlignedActionDiT as ActionDiT
 from .helpers.loader import load_ltx2_video_only_components
 from .mot import MoT
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
+from .schedulers.scheduler_ltx2 import LTX2FlowMatchScheduler
 
 logger = get_logger(__name__)
 
@@ -33,10 +34,20 @@ class FastWAM(torch.nn.Module):
         video_infer_shift: float = 5.0,
         video_num_train_timesteps: int = 1000,
         video_train_sigma_floor: float = 0.0,
+        video_scheduler_type: str = "wan",
+        video_min_shift: float = 0.95,
+        video_max_shift: float = 2.05,
+        video_min_tokens: int = 1024,
+        video_max_tokens: int = 4096,
         action_train_shift: float = 5.0,
         action_infer_shift: float = 5.0,
         action_num_train_timesteps: int = 1000,
         action_train_sigma_floor: float = 0.0,
+        action_scheduler_type: str = "wan",
+        action_min_shift: float = 0.95,
+        action_max_shift: float = 2.05,
+        action_min_tokens: int = 1024,
+        action_max_tokens: int = 4096,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
     ):
@@ -61,24 +72,69 @@ class FastWAM(torch.nn.Module):
         else:
             self.proprio_encoder = None
 
-        self.train_video_scheduler = WanContinuousFlowMatchScheduler(
-            num_train_timesteps=video_num_train_timesteps,
-            shift=video_train_shift,
-            sigma_floor=video_train_sigma_floor,
-        )
-        self.infer_video_scheduler = WanContinuousFlowMatchScheduler(
-            num_train_timesteps=video_num_train_timesteps,
-            shift=video_infer_shift,
-        )
-        self.train_action_scheduler = WanContinuousFlowMatchScheduler(
-            num_train_timesteps=action_num_train_timesteps,
-            shift=action_train_shift,
-            sigma_floor=action_train_sigma_floor,
-        )
-        self.infer_action_scheduler = WanContinuousFlowMatchScheduler(
-            num_train_timesteps=action_num_train_timesteps,
-            shift=action_infer_shift,
-        )
+        if video_scheduler_type == "ltx2":
+            self.train_video_scheduler = LTX2FlowMatchScheduler(
+                num_train_timesteps=video_num_train_timesteps,
+                min_shift=video_min_shift,
+                max_shift=video_max_shift,
+                min_tokens=video_min_tokens,
+                max_tokens=video_max_tokens,
+                infer_shift=video_infer_shift,
+            )
+            self.infer_video_scheduler = LTX2FlowMatchScheduler(
+                num_train_timesteps=video_num_train_timesteps,
+                min_shift=video_min_shift,
+                max_shift=video_max_shift,
+                min_tokens=video_min_tokens,
+                max_tokens=video_max_tokens,
+                infer_shift=video_infer_shift,
+            )
+        elif video_scheduler_type == "wan":
+            self.train_video_scheduler = WanContinuousFlowMatchScheduler(
+                num_train_timesteps=video_num_train_timesteps,
+                shift=video_train_shift,
+                sigma_floor=video_train_sigma_floor,
+            )
+            self.infer_video_scheduler = WanContinuousFlowMatchScheduler(
+                num_train_timesteps=video_num_train_timesteps,
+                shift=video_infer_shift,
+            )
+        else:
+            raise ValueError(
+                f"Unknown video_scheduler_type={video_scheduler_type!r}; expected 'wan' or 'ltx2'."
+            )
+
+        if action_scheduler_type == "ltx2":
+            self.train_action_scheduler = LTX2FlowMatchScheduler(
+                num_train_timesteps=action_num_train_timesteps,
+                min_shift=action_min_shift,
+                max_shift=action_max_shift,
+                min_tokens=action_min_tokens,
+                max_tokens=action_max_tokens,
+                infer_shift=action_infer_shift,
+            )
+            self.infer_action_scheduler = LTX2FlowMatchScheduler(
+                num_train_timesteps=action_num_train_timesteps,
+                min_shift=action_min_shift,
+                max_shift=action_max_shift,
+                min_tokens=action_min_tokens,
+                max_tokens=action_max_tokens,
+                infer_shift=action_infer_shift,
+            )
+        elif action_scheduler_type == "wan":
+            self.train_action_scheduler = WanContinuousFlowMatchScheduler(
+                num_train_timesteps=action_num_train_timesteps,
+                shift=action_train_shift,
+                sigma_floor=action_train_sigma_floor,
+            )
+            self.infer_action_scheduler = WanContinuousFlowMatchScheduler(
+                num_train_timesteps=action_num_train_timesteps,
+                shift=action_infer_shift,
+            )
+        else:
+            raise ValueError(
+                f"Unknown action_scheduler_type={action_scheduler_type!r}; expected 'wan' or 'ltx2'."
+            )
         # Optional aliases for consistency with LTXCore naming.
         self.train_scheduler = self.train_video_scheduler
         self.infer_scheduler = self.infer_video_scheduler
@@ -123,10 +179,20 @@ class FastWAM(torch.nn.Module):
         video_infer_shift: float = 5.0,
         video_num_train_timesteps: int = 1000,
         video_train_sigma_floor: float = 0.0,
+        video_scheduler_type: str = "wan",
+        video_min_shift: float = 0.95,
+        video_max_shift: float = 2.05,
+        video_min_tokens: int = 1024,
+        video_max_tokens: int = 4096,
         action_train_shift: float = 5.0,
         action_infer_shift: float = 5.0,
         action_num_train_timesteps: int = 1000,
         action_train_sigma_floor: float = 0.0,
+        action_scheduler_type: str = "wan",
+        action_min_shift: float = 0.95,
+        action_max_shift: float = 2.05,
+        action_min_tokens: int = 1024,
+        action_max_tokens: int = 4096,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
     ):
@@ -179,10 +245,20 @@ class FastWAM(torch.nn.Module):
             video_infer_shift=video_infer_shift,
             video_num_train_timesteps=video_num_train_timesteps,
             video_train_sigma_floor=video_train_sigma_floor,
+            video_scheduler_type=video_scheduler_type,
+            video_min_shift=video_min_shift,
+            video_max_shift=video_max_shift,
+            video_min_tokens=video_min_tokens,
+            video_max_tokens=video_max_tokens,
             action_train_shift=action_train_shift,
             action_infer_shift=action_infer_shift,
             action_num_train_timesteps=action_num_train_timesteps,
             action_train_sigma_floor=action_train_sigma_floor,
+            action_scheduler_type=action_scheduler_type,
+            action_min_shift=action_min_shift,
+            action_max_shift=action_max_shift,
+            action_min_tokens=action_min_tokens,
+            action_max_tokens=action_max_tokens,
             loss_lambda_video=loss_lambda_video,
             loss_lambda_action=loss_lambda_action,
         )
@@ -466,11 +542,20 @@ class FastWAM(torch.nn.Module):
         action_is_pad = inputs["action_is_pad"]
         image_is_pad = inputs["image_is_pad"]
 
+        # Compute per-stream patched token counts so LTX2-style schedulers can
+        # set shift = lerp(min_shift, max_shift, seq_length). Video latent shape
+        # is (B, C, F, H, W) post-VAE-encode, pre-patchify; patchify is 1×1×1
+        # so seq_length = F·H·W. Action has shape (B, T_act, D); seq_length =
+        # T_act. Wan-style schedulers ignore `seq_length` (interface parity).
+        seq_length_video = int(input_latents.shape[2] * input_latents.shape[3] * input_latents.shape[4])
+        seq_length_action = int(action.shape[1])
+
         noise_video = torch.randn_like(input_latents)
         timestep_video = self.train_video_scheduler.sample_training_t(
             batch_size=batch_size,
             device=self.device,
             dtype=input_latents.dtype,
+            seq_length=seq_length_video,
         )
         latents = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)
         sigma_video = timestep_video / float(max(self.train_video_scheduler.num_train_timesteps, 1))
@@ -484,6 +569,7 @@ class FastWAM(torch.nn.Module):
             batch_size=batch_size,
             device=self.device,
             dtype=action.dtype,
+            seq_length=seq_length_action,
         )
         noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
         sigma_action = timestep_action / float(max(self.train_action_scheduler.num_train_timesteps, 1))
@@ -748,6 +834,7 @@ class FastWAM(torch.nn.Module):
             video_kv_cache=video_kv_cache,
             attention_mask=attention_mask,
             video_seq_len=video_seq_len,
+            action_prompt_timestep=action_pre.get("prompt_timestep"),
         )
         return self.action_expert.post_dit(action_tokens, action_pre)
 
@@ -1048,6 +1135,7 @@ class FastWAM(torch.nn.Module):
                 "mask": video_pre["context_mask"],
             },
             video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
+            video_prompt_timestep=video_pre.get("prompt_timestep"),
         )
 
         infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(

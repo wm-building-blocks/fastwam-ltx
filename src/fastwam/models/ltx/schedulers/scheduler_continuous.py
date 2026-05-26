@@ -31,7 +31,18 @@ class WanContinuousFlowMatchScheduler:
         norm_const = float(y_shifted_grid.mean().item())
         return y_min, norm_const
 
-    def sample_training_t(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    def sample_training_t(
+        self,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        seq_length: int | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        # `seq_length` is accepted for interface parity with
+        # LTX2FlowMatchScheduler (which makes shift token-count-dependent); the
+        # Wan-style phi(u, shift) sampler is independent of token count.
+        del seq_length, kwargs
         if batch_size <= 0:
             raise ValueError(f"`batch_size` must be positive, got {batch_size}")
         u = torch.rand((batch_size,), device=device, dtype=torch.float32)

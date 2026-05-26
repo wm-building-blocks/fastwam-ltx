@@ -3,13 +3,16 @@ import json
 import inspect
 import os
 import re
+import subprocess
 from math import ceil
 from pathlib import Path
 import time
 
+from datetime import timedelta
+
 import numpy as np
 import torch
-from accelerate import Accelerator
+from accelerate import Accelerator, InitProcessGroupKwargs
 from omegaconf import DictConfig
 from PIL import Image
 from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, LinearLR, SequentialLR
@@ -36,6 +39,11 @@ class Wan22Trainer:
         self.weight_decay = float(cfg.weight_decay)
         self.batch_size = int(cfg.batch_size)
         self.num_workers = int(cfg.num_workers)
+        # Batches each worker pre-loads ahead of demand. The dataset decodes
+        # multi-camera video from .mp4 on the fly (variable CPU cost), so a
+        # deeper prefetch queue smooths per-step jitter. Default 4 (DataLoader's
+        # own default is 2); inert when num_workers == 0.
+        self.prefetch_factor = int(cfg.get("prefetch_factor", 4))
         self.num_epochs = int(cfg.num_epochs)
         max_steps = cfg.max_steps
         self.max_steps = int(max_steps) if max_steps is not None else None
@@ -47,11 +55,31 @@ class Wan22Trainer:
         self.state_keep_last_n = int(cfg.get("state_keep_last_n", 1))
         self.weights_keep_last_n = int(cfg.get("weights_keep_last_n", 1))
         self.long_term_save_every = int(cfg.get("long_term_save_every", 0))
+        # State long-term retention (separate from weights):
+        #   keep state at steps where step % state_long_term_save_every == 0
+        #   AND step >= state_long_term_start. 0 = disabled (default).
+        self.state_long_term_save_every = int(cfg.get("state_long_term_save_every", 0))
+        self.state_long_term_start = int(cfg.get("state_long_term_start", 0))
         self.eval_every = int(cfg.eval_every)
         self.eval_num_inference_steps = int(cfg.eval_num_inference_steps)
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
         self.max_grad_norm = float(cfg.max_grad_norm)
         self.seed = int(cfg.seed)
+        # torch.compile the MoT transformer blocks (block-level so it composes
+        # with FSDP's per-MoTBlock wrap). Off by default — needs a GPU smoke
+        # test to confirm no graph breaks / recompiles on the real shapes.
+        self.compile_mot = bool(cfg.get("compile_mot", False))
+        # Optimizer: "adamw" (fp32 moments) or "adamw8bit" (bitsandbytes 8-bit
+        # moments, ~halves optimizer-state VRAM). 8-bit is effective under FSDP
+        # / ZeRO-1 / DDP where the state lives on GPU; under DeepSpeed ZeRO-2
+        # with CPU offload DeepSpeed substitutes its own optimizer and this is
+        # only a hyperparameter placeholder.
+        self.optimizer_type = str(cfg.get("optimizer_type", "adamw")).strip().lower()
+        if self.optimizer_type not in {"adamw", "adamw8bit"}:
+            raise ValueError(
+                f"Unsupported optimizer_type: {cfg.get('optimizer_type')}. "
+                "Expected one of: ['adamw', 'adamw8bit']."
+            )
         
         self.resume = cfg.resume
         self.mixed_precision = str(cfg.mixed_precision).strip().lower()
@@ -62,10 +90,17 @@ class Wan22Trainer:
             )
         self.wandb_enabled = bool(cfg.wandb.enabled)
 
+        # NCCL collective timeout. PyTorch's default is 10 min, which is too
+        # tight for large FSDP runs: a transient filesystem hiccup or GC pause
+        # on any one rank can stall a single small collective (e.g. the
+        # grad-norm all-gather) past 10 min, the watchdog fires, and every rank
+        # SIGABRTs — losing the run. 30 min absorbs most stalls.
+        init_kwargs = InitProcessGroupKwargs(timeout=timedelta(minutes=30))
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.gradient_accumulation_steps,
             mixed_precision=self.mixed_precision,
             step_scheduler_with_optimizer=False,
+            kwargs_handlers=[init_kwargs],
         )
 
         if torch.cuda.is_available():
@@ -103,14 +138,29 @@ class Wan22Trainer:
         if proprio_encoder is not None:
             trainable_params.extend(list(proprio_encoder.parameters()))
         # DeepSpeed Zero-2 with offload_optimizer.device=cpu will route this through
-        # DeepSpeedCPUAdam automatically; the torch.optim.AdamW constructor is just
-        # the placeholder DeepSpeed inspects for hyperparameters.
-        self.optimizer = torch.optim.AdamW(
-            trainable_params,
-            lr=self.learning_rate,
-            weight_decay=self.weight_decay,
-            betas=(0.9, 0.95),
-        )
+        # DeepSpeedCPUAdam automatically; the constructor here is just the
+        # placeholder DeepSpeed inspects for hyperparameters.
+        if self.optimizer_type == "adamw8bit":
+            try:
+                from bitsandbytes.optim import AdamW8bit
+            except ImportError as e:
+                raise ImportError(
+                    "optimizer_type='adamw8bit' requires the `bitsandbytes` package."
+                ) from e
+            self.optimizer = AdamW8bit(
+                trainable_params,
+                lr=self.learning_rate,
+                weight_decay=self.weight_decay,
+                betas=(0.9, 0.95),
+            )
+            logger.info("Optimizer: bitsandbytes AdamW8bit (8-bit moments).")
+        else:
+            self.optimizer = torch.optim.AdamW(
+                trainable_params,
+                lr=self.learning_rate,
+                weight_decay=self.weight_decay,
+                betas=(0.9, 0.95),
+            )
         
         self.train_loader = self._build_loader(self.train_dataset, worker_init_fn=worker_init_fn)
         total_train_steps = self._estimate_total_train_steps()
@@ -136,10 +186,42 @@ class Wan22Trainer:
         ensure_dir(self.state_dir)
         ensure_dir(self.eval_dir)
 
+        self._maybe_compile_mot()
         self.model, self.optimizer, self.train_loader, self.scheduler = self.accelerator.prepare(
             self.model, self.optimizer, self.train_loader, self.scheduler
         )
         self.optimizer.zero_grad(set_to_none=True)
+
+        # --- bitsandbytes-8bit x FSDP checkpoint incompatibility ----------
+        # `accelerator.save_state` routes the optimizer through
+        # `FSDP.optim_state_dict`, whose `_convert_all_state_info` machinery
+        # assumes every optimizer-state tensor for a parameter has the same
+        # numel as the (unsharded) parameter, so it can all-gather / reshard
+        # it. bitsandbytes 8-bit optimizers violate that: their per-param
+        # state is block-quantized — `state1`/`state2` (uint8) plus
+        # `absmax1`/`absmax2` (fp32, ~1/2048 the size) and `qmap` tensors —
+        # none of which share the parameter's numel. FSDP cannot reshape
+        # them and crashes with a tensor-size mismatch in
+        # `_convert_all_state_info`.
+        #
+        # So when (and only when) we run AdamW8bit under FSDP, we bypass
+        # `accelerator.save_state`/`load_state` for the optimizer and persist
+        # the rank-local bnb optimizer shard directly via
+        # `self.optimizer.state_dict()` (which does NOT trigger the FSDP
+        # gather). Model weights still use the FULL_STATE_DICT `.pt` path
+        # (`_save_weights_checkpoint`), which works fine. The plain `adamw`
+        # path is unaffected and keeps using `accelerator.save_state`.
+        from accelerate import DistributedType as _DistributedType
+        self._manual_optim_ckpt = (
+            self.optimizer_type == "adamw8bit"
+            and self.accelerator.distributed_type == _DistributedType.FSDP
+        )
+        if self._manual_optim_ckpt:
+            logger.info(
+                "adamw8bit + FSDP detected: checkpointing will use the manual "
+                "per-rank optimizer-state path (bypassing FSDP.optim_state_dict)."
+            )
+
         self.wandb_run = None
         self._init_wandb()
         self._resume_or_load_checkpoint()
@@ -197,7 +279,14 @@ class Wan22Trainer:
             sampler=self.train_sampler,
             num_workers=self.num_workers,
             pin_memory=torch.cuda.is_available(),
+            prefetch_factor=self.prefetch_factor if self.num_workers > 0 else None,
             worker_init_fn=worker_init_fn,
+            # Keep workers alive across epoch boundaries. The training loop
+            # re-creates the dataloader iterator every epoch; without this the
+            # worker processes are torn down and respawned each time — and each
+            # respawn re-loads the per-worker CPU text encoder. Only valid when
+            # num_workers > 0.
+            persistent_workers=self.num_workers > 0,
         )
 
     def _assert_dataset_length_consistent(self, dataset, dataset_name: str):
@@ -455,11 +544,34 @@ class Wan22Trainer:
                 return FSDP.summon_full_params(self.model, recurse=False, writeback=False)
             return nullcontext()
 
+        # Eval mp4 reflects the model's autonomous policy behavior:
+        # 1) Run action expert solo (no gt) to obtain pred_action.
+        # 2) Condition video generation on pred_action.
+        # This makes the saved mp4 + downstream PSNR/SSIM measure the end-to-end
+        # rollout the model would actually produce, rather than "video given the
+        # gt action sequence" (which decouples video quality from policy quality
+        # but hides policy failures). action_l1/action_l2 still come from the
+        # same pred_action vs gt comparison and remain meaningful.
+        with _fsdp_root_summon(), self.accelerator.autocast():
+            _pred_only = model.infer_action(
+                prompt=infer_kwargs.get("prompt"),
+                input_image=input_image,
+                action_horizon=sample['action_horizon'],
+                context=infer_kwargs.get("context"),
+                context_mask=infer_kwargs.get("context_mask"),
+                proprio=proprio,
+                num_inference_steps=self.eval_num_inference_steps,
+                seed=42,
+            )
+        infer_kwargs["action"] = _pred_only["action"].to(
+            device=model.device, dtype=model.torch_dtype
+        )
+
         with _fsdp_root_summon(), self.accelerator.autocast():
             pred = model.infer(
                 **infer_kwargs,
             )
-        
+
         pred_video = pred["video"]
         pred_action = pred.get("action", None)
 
@@ -602,6 +714,13 @@ class Wan22Trainer:
             result["action_l2"] = float(action_l2_mean)
         if action_l1_mean is not None:
             result["action_l1"] = float(action_l1_mean)
+
+        # Free intermediate tensors created during inference (KV cache list,
+        # action denoising buffers, decode output). Without this, the next
+        # `save_state` collective allocates its plan-exchange tensors against
+        # a fragmented allocator and trips NCCL OOM on the dcp reduce_scatter.
+        del local_metrics, gathered_metrics, mean_metrics
+        torch.cuda.empty_cache()
         return result
 
     def _save_weights_checkpoint(self, step_tag: str):
@@ -659,6 +778,13 @@ class Wan22Trainer:
             "epoch": int(self.epoch),
             "batch_in_epoch": int(self.batch_in_epoch),
         }
+        # For the manual adamw8bit+FSDP path the optimizer state is sharded
+        # per-rank, so the checkpoint is only loadable at the same world size.
+        # Record it (and a marker) so `load_training_state` can detect the
+        # manual layout and validate the world size on resume.
+        if self._manual_optim_ckpt:
+            payload["manual_optim_ckpt"] = True
+            payload["world_size"] = int(self.accelerator.num_processes)
         with open(state_file, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=True, indent=2)
 
@@ -668,11 +794,19 @@ class Wan22Trainer:
         return int(m.group(1)) if m else None
 
     def _rotate_state_dir(self):
-        """Delete old state dirs before writing a new one, keeping only the
-        most recent ``state_keep_last_n - 1`` entries (the new save will fill
-        the Nth slot). Long-term anchors are NOT preserved for state — state
-        is only useful for `accelerator.load_state` resume, which always
-        wants the latest."""
+        """Delete old state dirs, keeping the most recent ``state_keep_last_n``
+        rolling entries plus any long-term anchors.
+
+        Called from ``save_checkpoint`` AFTER the new state is written and
+        fsynced, so the just-saved dir is already in ``entries`` and counts
+        toward ``state_keep_last_n``.
+
+        Two retention bands (union is preserved):
+          - Rolling: most recent ``state_keep_last_n`` entries.
+          - Long-term anchors: steps where step % ``state_long_term_save_every`` == 0
+            AND step >= ``state_long_term_start``. Disabled when
+            ``state_long_term_save_every`` is 0 (default).
+        """
         if not os.path.isdir(self.state_dir):
             return
         entries = []
@@ -682,9 +816,16 @@ class Wan22Trainer:
             if s is not None and os.path.isdir(full):
                 entries.append((s, full))
         entries.sort(key=lambda t: t[0])
-        # Keep the most recent (keep_last_n - 1); about to write a new one.
-        cutoff = max(self.state_keep_last_n - 1, 0)
-        to_delete = entries[:-cutoff] if cutoff > 0 else entries
+
+        long_term = self.state_long_term_save_every
+        long_term_start = self.state_long_term_start
+        is_long_term = lambda s: (
+            long_term > 0 and s % long_term == 0 and s >= long_term_start
+        )
+
+        rolling = [e for e in entries if not is_long_term(e[0])]
+        cutoff = max(self.state_keep_last_n, 0)
+        to_delete = rolling[:-cutoff] if cutoff > 0 else rolling
         import shutil
         for _, path in to_delete:
             logger.info("Rotating out old state dir: %s", path)
@@ -692,8 +833,13 @@ class Wan22Trainer:
 
     def _rotate_weights_dir(self):
         """Delete old weights files, keeping the most recent
-        ``weights_keep_last_n - 1`` rolling files plus any "long-term"
-        anchors (multiples of ``long_term_save_every``)."""
+        ``weights_keep_last_n`` rolling files plus any long-term anchors
+        (multiples of ``long_term_save_every``).
+
+        Called from ``save_checkpoint`` AFTER the new weights file is written
+        and fsynced, so the just-saved file is already in ``entries`` and
+        counts toward ``weights_keep_last_n``.
+        """
         if not os.path.isdir(self.weights_dir):
             return
         entries = []
@@ -711,7 +857,7 @@ class Wan22Trainer:
         is_long_term = lambda s: long_term > 0 and (s % long_term == 0)
 
         rolling = [e for e in entries if not is_long_term(e[0])]
-        cutoff = max(self.weights_keep_last_n - 1, 0)
+        cutoff = max(self.weights_keep_last_n, 0)
         to_delete = rolling[:-cutoff] if cutoff > 0 else rolling
         for _, path in to_delete:
             logger.info("Rotating out old weights file: %s", path)
@@ -720,18 +866,64 @@ class Wan22Trainer:
             except OSError as e:
                 logger.warning("Failed to remove %s: %s", path, e)
 
+    def _drop_page_cache_for_save(self):
+        """Evict Linux page cache before a checkpoint write to make headroom
+        for the writeback spike.
+
+        Long runs accumulate huge page cache (~800GB observed on the
+        2TB-RAM host after a few epochs over the 75GB dataset). The ~140GB
+        write spike of a state save can race the kernel's reclaim and
+        trigger global host OOM that wipes the in-flight checkpoint and
+        kills training (incident 2026-05-24, see FASTWAM_LTX.md §2.5).
+
+        ``sync`` flushes dirty pages first (so nothing in-flight is lost);
+        ``drop_caches=1`` then evicts only clean cache. Requires
+        passwordless sudo for ``tee /proc/sys/vm/drop_caches``. Failure
+        logs a warning and proceeds — save then runs as before the fix.
+        """
+        try:
+            subprocess.run(["sync"], check=False, timeout=60)
+            result = subprocess.run(
+                ["sudo", "-n", "tee", "/proc/sys/vm/drop_caches"],
+                input=b"1\n",
+                check=False,
+                capture_output=True,
+                timeout=30,
+            )
+            if result.returncode != 0:
+                logger.warning(
+                    "drop_caches failed (rc=%d, stderr=%s); save proceeds "
+                    "without page-cache headroom",
+                    result.returncode,
+                    result.stderr.decode("utf-8", errors="replace")[:200],
+                )
+            else:
+                logger.info("drop_caches=1 issued before checkpoint save")
+        except Exception as e:
+            logger.warning(
+                "drop_caches errored (%s); save proceeds anyway", e
+            )
+
     def save_checkpoint(self):
         step_tag = f"step_{self.global_step:06d}"
 
-        # Rotate BEFORE writing the new checkpoint, so transient disk usage
-        # never holds (n + 1) state dirs simultaneously. Risk: if the save
-        # itself crashes mid-write we lose the previous rolling slot, but
-        # long-term weights anchors are preserved either way.
+        # Drop Linux page cache before writing — long runs accumulate ~800GB
+        # of page cache, and the ~140GB writeback spike of a state save
+        # raced kernel reclaim and triggered global host OOM (incident
+        # 2026-05-24 wiped all ckpts; see FASTWAM_LTX.md §2.5). drop_caches
+        # only evicts clean cache, sync flushes dirty pages first.
         self.accelerator.wait_for_everyone()
         if self.accelerator.is_main_process:
-            self._rotate_state_dir()
-            self._rotate_weights_dir()
+            self._drop_page_cache_for_save()
         self.accelerator.wait_for_everyone()
+
+        # Save FIRST, then rotate. The previous order was rotate-then-save,
+        # which lost the previous slot if save crashed mid-write — that's
+        # exactly what happened at step 7500 on 2026-05-24 (step_005000 was
+        # deleted before the OOM hit during step_007500 save, leaving no
+        # resumable ckpt). Transient disk cost: ~2x state during the save
+        # window (state_keep_last_n=2 → ~280GB), still well under disk
+        # budget. See FASTWAM_LTX.md §2.5.
 
         # _save_weights_checkpoint now runs on all ranks (state_dict gathering
         # is a collective op under FSDP); the function itself guards disk writes
@@ -741,14 +933,224 @@ class Wan22Trainer:
 
         state_path = os.path.join(self.state_dir, step_tag)
         ensure_dir(state_path)
-        self.accelerator.save_state(output_dir=state_path)
+
+        if self._manual_optim_ckpt:
+            # Manual adamw8bit + FSDP path: `accelerator.save_state` routes the
+            # optimizer through `FSDP.optim_state_dict`, which crashes on the
+            # block-quantized bnb 8-bit state (see __init__). Save the pieces
+            # separately:
+            #   * model — accelerate's own FSDP model save (DCP, the
+            #     SHARDED_STATE_DICT path). This is exactly what
+            #     `accelerator.save_state` does for the model and it works
+            #     fine; only the optimizer half is broken. Reusing it avoids
+            #     hand-rolling a state_dict over the MoT's shared-parameter
+            #     structure (mot.blocks vs mot.mixtures.*._inner).
+            #   * optimizer — each rank writes its own raw bnb shard via
+            #     `self.optimizer.state_dict()`: rank-local, triggers no
+            #     collective, so it never reaches the FSDP.optim_state_dict
+            #     gather that breaks.
+            #   * scheduler — rank-replicated, so only rank 0 writes it.
+            from accelerate.utils.fsdp_utils import save_fsdp_model
+
+            save_fsdp_model(
+                self.accelerator.state.fsdp_plugin,
+                self.accelerator,
+                self.model,
+                state_path,
+                0,
+            )
+            rank = self.accelerator.process_index
+            optim_path = os.path.join(state_path, f"optimizer_rank{rank}.pt")
+            torch.save(self.optimizer.state_dict(), optim_path)
+            if self.accelerator.is_main_process:
+                torch.save(
+                    self.scheduler.state_dict(),
+                    os.path.join(state_path, "scheduler.pt"),
+                )
+                self._save_trainer_state(state_path)
+            # Barrier so every rank's per-rank optimizer write has landed on
+            # disk before save_checkpoint returns (rotation of this dir on the
+            # next save must not race a still-writing rank).
+            self.accelerator.wait_for_everyone()
+        else:
+            # Plain adamw / DeepSpeed / DDP path — unchanged.
+            self.accelerator.save_state(output_dir=state_path)
+            if self.accelerator.is_main_process:
+                self._save_trainer_state(state_path)
+            self.accelerator.wait_for_everyone()
+
+        # New state is fully written across all ranks. Sync to disk before
+        # rotation so the new ckpt is durable before we delete the old one
+        # (os.sync flushes the whole kernel writeback queue, not just our
+        # files — overkill but cheap and unambiguous).
         if self.accelerator.is_main_process:
-            self._save_trainer_state(state_path)
+            os.sync()
+            self._rotate_state_dir()
+            self._rotate_weights_dir()
         self.accelerator.wait_for_everyone()
 
         return {"weights_path": ckpt_path, "state_path": state_path}
 
+    @staticmethod
+    def _is_manual_optim_ckpt_dir(state_dir: str) -> bool:
+        """A manual adamw8bit+FSDP checkpoint dir is identified either by the
+        `manual_optim_ckpt` marker in `trainer_state.json` or, defensively, by
+        the presence of `optimizer_rank*.pt` shard files."""
+        state_dir = Path(state_dir)
+        state_file = state_dir / "trainer_state.json"
+        if state_file.exists():
+            try:
+                with open(state_file, "r", encoding="utf-8") as f:
+                    if bool(json.load(f).get("manual_optim_ckpt", False)):
+                        return True
+            except (json.JSONDecodeError, OSError):
+                pass
+        return any(state_dir.glob("optimizer_rank*.pt"))
+
+    def _load_manual_training_state(self, state_dir: str):
+        """Resume the manual adamw8bit+FSDP checkpoint written by
+        `save_checkpoint`: accelerate FSDP sharded model state + per-rank bnb
+        optimizer shards + rank-replicated scheduler. Counterpart to the manual
+        save branch — it deliberately does NOT call `accelerator.load_state`
+        (whose optimizer half hits the same FSDP.optim_state_dict break)."""
+        state_dir = Path(state_dir)
+        state_file = state_dir / "trainer_state.json"
+        if not state_file.exists():
+            raise FileNotFoundError(
+                f"Manual-checkpoint resume requires `trainer_state.json` in {state_dir}"
+            )
+        with open(state_file, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+
+        # Per-rank optimizer shards are only valid for the same world size.
+        saved_world_size = int(payload.get("world_size", -1))
+        cur_world_size = int(self.accelerator.num_processes)
+        if saved_world_size != cur_world_size:
+            raise RuntimeError(
+                "Cannot resume manual adamw8bit+FSDP checkpoint: it was saved "
+                f"with world_size={saved_world_size} but the current run has "
+                f"world_size={cur_world_size}. Per-rank optimizer shards are "
+                "only loadable at the identical world size."
+            )
+
+        # Model: replicate accelerate's `load_fsdp_model` SHARDED_STATE_DICT
+        # path (DCP read of the `pytorch_model_fsdp_0/` dir written by
+        # `save_fsdp_model`) BUT finish with a NON-strict `load_state_dict`.
+        #
+        # Why non-strict: a MoT block param is reachable through aliased module
+        # paths (mot.blocks.<i>.<expert>_block.* — the FSDP-wrapped canonical
+        # one — plus mixtures.<expert>.blocks.* and
+        # mixtures.video._inner.transformer_blocks.*). Only the canonical path
+        # is checkpointed (the MoT save hook drops the aliases) and only it is
+        # loadable — the alias paths are FSDP placeholders that cannot receive
+        # data. accelerate's `load_fsdp_model` does a *strict* load, which
+        # rejects the (intentionally) missing alias keys. Non-strict tolerates
+        # them; the shared nn.Module references propagate the canonical values
+        # to the alias paths automatically.
+        import torch.distributed.checkpoint as dist_cp
+        from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        fsdp_plugin = self.accelerator.state.fsdp_plugin
+        ckpt_dir = os.path.join(str(state_dir), "pytorch_model_fsdp_0")
+        logger.info("Manual-checkpoint resume: restoring FSDP model state from %s", ckpt_dir)
+        with FSDP.state_dict_type(
+            self.model,
+            fsdp_plugin.state_dict_type,
+            fsdp_plugin.state_dict_config,
+            fsdp_plugin.optim_state_dict_config,
+        ):
+            model_sd = {"model": self.model.state_dict()}
+            dist_cp.load(
+                state_dict=model_sd,
+                storage_reader=dist_cp.FileSystemReader(ckpt_dir),
+                planner=DefaultLoadPlanner(),
+            )
+            missing, unexpected = self.model.load_state_dict(
+                model_sd["model"], strict=False
+            )
+        # Only the alias paths may be missing; a missing canonical block key
+        # (or any unexpected key) is a real corruption.
+        bad_missing = [
+            k for k in missing
+            if ".video_block." in k or ".action_block." in k
+        ]
+        if unexpected:
+            raise RuntimeError(
+                f"Manual-checkpoint resume: unexpected model keys "
+                f"{unexpected[:6]}{'...' if len(unexpected) > 6 else ''}"
+            )
+        if bad_missing:
+            raise RuntimeError(
+                f"Manual-checkpoint resume: canonical block keys missing "
+                f"{bad_missing[:6]}{'...' if len(bad_missing) > 6 else ''}"
+            )
+
+        # Optimizer: each rank loads its own bnb shard.
+        rank = self.accelerator.process_index
+        optim_path = state_dir / f"optimizer_rank{rank}.pt"
+        if not optim_path.exists():
+            raise FileNotFoundError(
+                f"Manual-checkpoint resume: optimizer shard not found for rank "
+                f"{rank}: {optim_path}"
+            )
+        self.optimizer.load_state_dict(torch.load(str(optim_path), map_location="cpu"))
+
+        # Scheduler: rank-replicated single file.
+        scheduler_path = state_dir / "scheduler.pt"
+        if scheduler_path.exists():
+            self.scheduler.load_state_dict(torch.load(str(scheduler_path), map_location="cpu"))
+        else:
+            logger.warning(
+                "Manual-checkpoint resume: `scheduler.pt` missing in %s; "
+                "scheduler state not restored.",
+                state_dir,
+            )
+
+        # Step / epoch / batch_in_epoch — identical semantics to the
+        # `accelerator.load_state` branch below.
+        self.global_step = int(payload["global_step"])
+        if "epoch" in payload and "batch_in_epoch" in payload:
+            self.epoch = int(payload["epoch"])
+            self.batch_in_epoch = int(payload["batch_in_epoch"])
+            self.train_sampler.set_epoch_offset(self.epoch)
+            self.train_sampler.set_resume_batch_offset(self.batch_in_epoch)
+            logger.info(
+                "Restored dataloader progress: epoch=%d batch_in_epoch=%d sample_offset=%d",
+                self.epoch,
+                self.batch_in_epoch,
+                self.batch_in_epoch * self.batch_size * self.accelerator.num_processes,
+            )
+        else:
+            self.epoch = 0
+            self.batch_in_epoch = 0
+            self.train_sampler.clear_resume_batch_offset()
+            logger.warning(
+                "Manual-checkpoint `trainer_state.json` lacks `epoch`/`batch_in_epoch`; "
+                "dataloader progress resume is skipped."
+            )
+        self.accelerator.wait_for_everyone()
+        logger.info(
+            "Resumed manual adamw8bit+FSDP training state from %s at step=%d",
+            state_dir,
+            self.global_step,
+        )
+
     def load_training_state(self, state_dir: str):
+        # Manual adamw8bit+FSDP checkpoints are saved with a layout
+        # `accelerator.load_state` cannot read (per-rank bnb optimizer shards,
+        # no accelerate plan files); detect and route them to the manual loader.
+        if self._is_manual_optim_ckpt_dir(state_dir):
+            if not self._manual_optim_ckpt:
+                raise RuntimeError(
+                    f"Checkpoint dir {state_dir} is a manual adamw8bit+FSDP "
+                    "checkpoint, but the current run is not configured for "
+                    "adamw8bit under FSDP. Resume it with the same "
+                    "optimizer_type / distributed setup."
+                )
+            self._load_manual_training_state(state_dir)
+            return
+
         self.accelerator.load_state(input_dir=state_dir)
         state_file = Path(state_dir) / "trainer_state.json"
         if state_file.exists():
@@ -793,6 +1195,113 @@ class Wan22Trainer:
             state_file,
         )
 
+    def _maybe_compile_mot(self):
+        """Block-level torch.compile of the MoT transformer blocks.
+
+        Compiles each ``MoTBlock`` **in place** via ``nn.Module.compile()`` —
+        NOT ``block = torch.compile(block)``. The latter replaces the block
+        with a ``torch._dynamo`` ``OptimizedModule`` wrapper, which:
+          * breaks ``accelerator.unwrap_model`` (``extract_model_from_parallel``
+            hits ``KeyError: '_orig_mod'``),
+          * stops FSDP's ``transformer_layer_cls_to_wrap=MoTBlock`` from
+            matching (the block is no longer a ``MoTBlock`` instance),
+          * prefixes ``state_dict`` keys with ``_orig_mod.``.
+        ``nn.Module.compile()`` compiles the forward in place and leaves the
+        module as a plain ``MoTBlock``, so all three problems disappear.
+
+        Runs before ``accelerator.prepare`` so FSDP wraps the (still
+        ``MoTBlock``-typed) blocks normally. No-op when there is no ``mot``.
+
+        Dynamo/Inductor knobs (ported from LTX-2's ``compile_transformer``):
+          * ``dynamic=True`` — the video token count varies per batch (frame
+            count / cameras); compiling for dynamic shapes avoids a recompile
+            on every new sequence length.
+          * ``cache_size_limit=256`` — headroom so the handful of shape/stride
+            variants the MoT block sees do not evict each other and thrash.
+          * ``inline_inbuilt_nn_modules`` — fewer graph breaks at submodule
+            boundaries, so Inductor can fuse across them (this is what
+            collapses the ~245k tiny elementwise/reduce kernel launches the
+            profiler flagged).
+        """
+        if not self.compile_mot:
+            return
+        mot = getattr(self.model, "mot", None)
+        blocks = getattr(mot, "blocks", None)
+        if blocks is None:
+            logger.warning("compile_mot=true but model has no `mot.blocks`; skipping torch.compile.")
+            return
+
+        # Global Dynamo/Inductor config — set once, applies to every compiled
+        # region. Guarded with hasattr so an older torch silently skips knobs
+        # it does not have rather than crashing.
+        import torch._dynamo as _dynamo
+        for attr, val in (
+            ("cache_size_limit", 256),
+            ("inline_inbuilt_nn_modules", True),
+            ("allow_unspec_int_on_nn_module", True),
+        ):
+            if hasattr(_dynamo.config, attr):
+                setattr(_dynamo.config, attr, val)
+
+        for blk in blocks:
+            blk.compile(dynamic=True)
+        logger.info(
+            "torch.compile applied in-place to %d MoT blocks (dynamic=True, "
+            "cache_size_limit=256).",
+            len(blocks),
+        )
+
+    def _maybe_build_profiler(self):
+        """Build a torch.profiler for this rank when FASTWAM_TRAINER_PROFILE=1.
+
+        Writes chrome traces to <output_dir>/profiler/. Use this to find where
+        a training step actually spends time (VAE encode vs MoT forward vs
+        dataloader) before reaching for compile / kernel changes.
+
+        Env knobs:
+          FASTWAM_TRAINER_PROFILE       "1" to enable (default off).
+          FASTWAM_TRAINER_PROFILE_RANKS comma-separated rank ints, or "all".
+                                        Default "0" (main process only).
+          FASTWAM_TRAINER_PROFILE_FREQ  steps between active traces (default 200,
+                                        must exceed warmup+active = 4).
+
+        schedule: wait → warmup(3) → active(1) → repeat. One active trace per
+        FREQ steps keeps trace volume and overhead negligible.
+        """
+        if os.environ.get("FASTWAM_TRAINER_PROFILE", "0") != "1":
+            return None
+
+        ranks_env = os.environ.get("FASTWAM_TRAINER_PROFILE_RANKS", "0").strip().lower()
+        if ranks_env == "all":
+            profile_this_rank = True
+        else:
+            target = {int(r) for r in ranks_env.split(",") if r.strip()}
+            profile_this_rank = self.accelerator.process_index in target
+        if not profile_this_rank:
+            return None
+
+        freq = max(int(os.environ.get("FASTWAM_TRAINER_PROFILE_FREQ", "200")), 5)
+        active, warmup = 1, 3
+        wait = max(freq - active - warmup, 0)
+        trace_dir = os.path.join(self.output_dir, "profiler")
+        ensure_dir(trace_dir)
+        logger.info(
+            "torch.profiler enabled (rank %d): active trace every %d steps -> %s",
+            self.accelerator.process_index,
+            freq,
+            trace_dir,
+        )
+        return torch.profiler.profile(
+            schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=0),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(trace_dir),
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=False,
+            with_stack=False,
+        )
+
     def train(self):
         self._set_dit_only_train_mode()
 
@@ -805,6 +1314,10 @@ class Wan22Trainer:
         data_iter = iter(self.train_loader)
         self.run_start_step = self.global_step
         self.run_start_time = time.perf_counter()
+
+        profiler = self._maybe_build_profiler()
+        if profiler is not None:
+            profiler.start()
 
         while self.global_step < self.max_steps:
             try:
@@ -826,54 +1339,82 @@ class Wan22Trainer:
 
                 if self.accelerator.sync_gradients:
                     grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                    self.optimizer.step()
-                    if not self.accelerator.optimizer_step_was_skipped:
-                        self.scheduler.step()
-                    self.optimizer.zero_grad(set_to_none=True)
+                    # Defensive nan/inf guard: if any rank has a non-finite
+                    # grad_norm, skip optimizer.step() on every rank so the
+                    # master weights stay clean. We all-gather a 0/1 flag so
+                    # all ranks make the same decision.
+                    grad_norm_local = (
+                        grad_norm.detach().float()
+                        if torch.is_tensor(grad_norm)
+                        else torch.tensor(float(grad_norm), device=loss.device, dtype=torch.float32)
+                    ).reshape(1)
+                    nonfinite_local = (~torch.isfinite(grad_norm_local)).long()
+                    nonfinite_gathered = self.accelerator.gather(nonfinite_local)
+                    skip_optim_step = bool(nonfinite_gathered.sum().item() > 0)
+                    if skip_optim_step:
+                        if self.accelerator.is_main_process:
+                            logger.warning(
+                                "step %d: non-finite grad_norm detected; skipping optimizer.step()",
+                                self.global_step + 1,
+                            )
+                        self.optimizer.zero_grad(set_to_none=True)
+                    else:
+                        self.optimizer.step()
+                        if not self.accelerator.optimizer_step_was_skipped:
+                            self.scheduler.step()
+                        self.optimizer.zero_grad(set_to_none=True)
                     self.global_step += 1
-                    global_loss = float(
-                        self.accelerator.gather(loss.detach().float().reshape(1)).mean().item()
-                    )
-                    global_loss_metrics = {}
-                    for key, value in loss_dict.items():
-                        metric_tensor = torch.tensor(float(value), device=loss.device, dtype=torch.float32).reshape(1)
-                        global_loss_metrics[key] = float(
-                            self.accelerator.gather(metric_tensor).mean().item()
-                        )
-                    grad_norm_tensor = torch.tensor(grad_norm, device=loss.device, dtype=torch.float32)
-                    global_grad_norm = float(self.accelerator.gather(grad_norm_tensor).mean().item())
-
                     current_lr = float(self.optimizer.param_groups[0]["lr"])
 
-                    if self.log_every > 0 and self.global_step % self.log_every == 0 and self.accelerator.is_main_process:
-                        eta_str, steps_per_sec = self._estimate_eta()
-                        description = "[train] epoch=%d step=%d/%d loss=%.4f " % (
-                            self.epoch,
-                            self.global_step,
-                            self.max_steps,
-                            global_loss,
+                    # Cross-rank loss/grad-norm reductions are only needed for
+                    # logging, so pay the all-gather collectives (and the .item()
+                    # device syncs they force) on log steps only — not on every
+                    # optimization step. The condition is identical on all ranks
+                    # (global_step is incremented in lockstep), so every rank
+                    # enters the gather block together — collective-safe.
+                    is_log_step = self.log_every > 0 and self.global_step % self.log_every == 0
+                    if is_log_step:
+                        global_loss = float(
+                            self.accelerator.gather(loss.detach().float().reshape(1)).mean().item()
                         )
-                        if global_loss_metrics:
-                            detail_str = " ".join([f"{k}={v:.4f}" for k, v in sorted(global_loss_metrics.items())])
-                            description += detail_str + " "
-                        description += "lr=%.2e speed=%.2f step/s, %.2f samples/s eta=%s" % (
-                            current_lr,
-                            steps_per_sec,
-                            steps_per_sec * self.batch_size * self.accelerator.num_processes,
-                            eta_str,
-                        )
-                        logger.info(description)
+                        global_loss_metrics = {}
+                        for key, value in loss_dict.items():
+                            metric_tensor = torch.tensor(float(value), device=loss.device, dtype=torch.float32).reshape(1)
+                            global_loss_metrics[key] = float(
+                                self.accelerator.gather(metric_tensor).mean().item()
+                            )
+                        grad_norm_tensor = torch.tensor(grad_norm, device=loss.device, dtype=torch.float32)
+                        global_grad_norm = float(self.accelerator.gather(grad_norm_tensor).mean().item())
 
-                        wandb_payload = {
-                            "train/loss": global_loss,
-                            "train/grad_norm": global_grad_norm,
-                            "train/lr": current_lr,
-                            "performance/steps_per_sec": steps_per_sec,
-                            "performance/samples_per_sec": steps_per_sec * self.batch_size * self.accelerator.num_processes,
-                        }
-                        for key, value in global_loss_metrics.items():
-                            wandb_payload[f"train/{key}"] = value
-                        self._wandb_log(wandb_payload)
+                        if self.accelerator.is_main_process:
+                            eta_str, steps_per_sec = self._estimate_eta()
+                            description = "[train] epoch=%d step=%d/%d loss=%.4f " % (
+                                self.epoch,
+                                self.global_step,
+                                self.max_steps,
+                                global_loss,
+                            )
+                            if global_loss_metrics:
+                                detail_str = " ".join([f"{k}={v:.4f}" for k, v in sorted(global_loss_metrics.items())])
+                                description += detail_str + " "
+                            description += "lr=%.2e speed=%.2f step/s, %.2f samples/s eta=%s" % (
+                                current_lr,
+                                steps_per_sec,
+                                steps_per_sec * self.batch_size * self.accelerator.num_processes,
+                                eta_str,
+                            )
+                            logger.info(description)
+
+                            wandb_payload = {
+                                "train/loss": global_loss,
+                                "train/grad_norm": global_grad_norm,
+                                "train/lr": current_lr,
+                                "performance/steps_per_sec": steps_per_sec,
+                                "performance/samples_per_sec": steps_per_sec * self.batch_size * self.accelerator.num_processes,
+                            }
+                            for key, value in global_loss_metrics.items():
+                                wandb_payload[f"train/{key}"] = value
+                            self._wandb_log(wandb_payload)
 
                     if (
                         self.eval_every > 0
@@ -919,23 +1460,45 @@ class Wan22Trainer:
                                 ckpt_info["state_path"],
                             )
 
+                    # Advance the profiler schedule once per optimization step.
+                    if profiler is not None:
+                        profiler.step()
+
                     if self.global_step >= self.max_steps:
-                        ckpt_info = self.save_checkpoint()
-                        if self.accelerator.is_main_process:
+                        if profiler is not None:
+                            profiler.stop()
+                        # save_every == 0 disables checkpointing entirely
+                        # (smoke tests) — skip the final save too.
+                        if self.save_every > 0:
+                            ckpt_info = self.save_checkpoint()
+                            if self.accelerator.is_main_process:
+                                logger.info(
+                                    "[done] max_steps reached step=%d weights=%s state=%s",
+                                    self.global_step,
+                                    ckpt_info["weights_path"],
+                                    ckpt_info["state_path"],
+                                )
+                        elif self.accelerator.is_main_process:
                             logger.info(
-                                "[done] max_steps reached step=%d weights=%s state=%s",
+                                "[done] max_steps reached step=%d (save_every=0, no checkpoint)",
                                 self.global_step,
-                                ckpt_info["weights_path"],
-                                ckpt_info["state_path"],
                             )
                         return
 
-        ckpt_info = self.save_checkpoint()
-        if self.accelerator.is_main_process:
+        if profiler is not None:
+            profiler.stop()
+        if self.save_every > 0:
+            ckpt_info = self.save_checkpoint()
+            if self.accelerator.is_main_process:
+                logger.info(
+                    "[done] training finished step=%d weights=%s state=%s",
+                    self.global_step,
+                    ckpt_info["weights_path"],
+                    ckpt_info["state_path"],
+                )
+        elif self.accelerator.is_main_process:
             logger.info(
-                "[done] training finished step=%d weights=%s state=%s",
+                "[done] training finished step=%d (save_every=0, no checkpoint)",
                 self.global_step,
-                ckpt_info["weights_path"],
-                ckpt_info["state_path"],
             )
         

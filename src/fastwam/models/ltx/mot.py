@@ -26,6 +26,7 @@ training joint path is sufficient to validate end-to-end.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -33,9 +34,44 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from .helpers.attention_backend import sdpa_backend_ctx
 from fastwam.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+
+# A MoT block param is reachable through several aliased module paths, all the
+# same nn.Module (see MoT.__init__):
+#   * `mixtures.<expert>.blocks.<i>.*`
+#   * `mixtures.video._inner.transformer_blocks.<i>.*` — the video expert sets
+#     `self.blocks = self._inner.transformer_blocks` (ltx_video_dit.py), so the
+#     LTX DiT's own `transformer_blocks` is a third alias of the same modules.
+# Only the canonical `blocks.<i>.{video,action}_block.*` path goes through the
+# MoTBlock FSDP unit; every alias path bypasses FSDP and yields broken sharded
+# flat-param shards (size [0] / partial) on save. Drop them all.
+_MIXTURES_BLOCKS_ALIAS_RE = re.compile(
+    r"mixtures\.[^.]+\.blocks\.\d+\."
+    r"|mixtures\.[^.]+\._inner\.transformer_blocks\.\d+\."
+)
+
+
+def _drop_mixtures_blocks_alias(module, state_dict, prefix, local_metadata):
+    """Drop MoT block alias keys from a MoT state_dict.
+
+    See MoT.__init__ and `_MIXTURES_BLOCKS_ALIAS_RE` for rationale. Keys are
+    full paths including `prefix` (e.g.
+    "mot.mixtures.video.blocks.0.attn1.to_q.weight" when this MoT lives under a
+    parent module that called state_dict with prefix="mot."). The parent's
+    traversal is unaffected — only this MoT's own emitted keys are filtered.
+    Non-block params under mixtures.<expert>.* and mixtures.video._inner.*
+    (patchify_proj, adaln_single, scale_shift_table, norm_out, proj_out) are
+    kept — they are NOT aliased through `self.blocks`.
+    """
+    for key in list(state_dict.keys()):
+        rel = key[len(prefix):] if key.startswith(prefix) else key
+        if _MIXTURES_BLOCKS_ALIAS_RE.match(rel):
+            del state_dict[key]
+    return state_dict
 
 
 try:
@@ -205,6 +241,17 @@ class MoTBlock(nn.Module):
         # `mot` as a submodule — otherwise MoT -> MoTBlock -> mot creates a cycle
         # that breaks `.to(device)` with infinite recursion.
         object.__setattr__(self, "_mot_ref", mot)
+        # `video_block` / `action_block` ARE registered as submodules of
+        # MoTBlock. This produces two paths to the same nn.Module in the
+        # model tree (`mot.mixtures.<expert>.blocks[i]` AND
+        # `mot.blocks[i].<>_block`); state_dict() therefore emits both. We
+        # filter the `mixtures.<>.blocks.*` alias on save (see MoT.__init__).
+        # FSDP wraps at `MoTBlock` granularity (see accelerate_fsdp.yaml);
+        # attempting to drop the submodule registration here and wrap at the
+        # inner block class triggers a FSDP recursive-wrap AssertionError.
+        # Resume from dcp `state/` currently fails because dcp records the
+        # alias side with shape (0,) — load uses `weights/.pt` + `strict=False`
+        # via `load_checkpoint` instead (see fastwam.py:1132).
         self.video_block = video_block
         self.action_block = action_block
         self.do_ckpt = bool(do_ckpt)
@@ -221,6 +268,10 @@ class MoTBlock(nn.Module):
     def forward(self, mode: str, **kwargs):
         if mode == "joint":
             return self._joint(**kwargs)
+        if mode == "video_prefill":
+            return self._video_prefill(**kwargs)
+        if mode == "action_with_kv":
+            return self._action_with_kv(**kwargs)
         raise ValueError(f"Unsupported MoTBlock mode: {mode!r}")
 
     def _joint(
@@ -287,6 +338,85 @@ class MoTBlock(nn.Module):
             start = end
         return out
 
+    def _video_prefill(
+        self,
+        *,
+        video_tokens: torch.Tensor,
+        video_freqs: Tuple[torch.Tensor, torch.Tensor],
+        video_t_mod: torch.Tensor,
+        video_context_payload: Optional[dict],
+        video_attention_mask: torch.Tensor,
+        video_prompt_timestep: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run video stream alone through this layer; cache post-rope K/V for
+        cross-stream attention in `_action_with_kv`. Mirrors the Wan-style
+        prefill API but uses LTX block internals.
+        """
+        mot = self._mot_ref
+        block = self.video_block
+        io = _build_expert_attention_io_ltx(
+            block, x=video_tokens, pe=video_freqs, t_mod=video_t_mod,
+        )
+        attn_additive = _fastwam_mask_to_additive(
+            video_attention_mask.to(io["q"].device), io["q"].dtype
+        )
+        mixed = self._joint_attention(
+            io["q"], io["k"], io["v"], mot.num_heads, attn_additive
+        )
+        ctx = video_context_payload or {}
+        new_video_tokens = _apply_expert_post_block_ltx(
+            block=block,
+            io_state=io,
+            mixed_attn_out=mixed,
+            t_mod=video_t_mod,
+            context=ctx.get("context"),
+            context_mask=ctx.get("mask"),
+            prompt_timestep=video_prompt_timestep,
+        )
+        return new_video_tokens, io["k"], io["v"]
+
+    def _action_with_kv(
+        self,
+        *,
+        action_tokens: torch.Tensor,
+        action_freqs: Tuple[torch.Tensor, torch.Tensor],
+        action_t_mod: torch.Tensor,
+        action_context_payload: Optional[dict],
+        k_video: torch.Tensor,
+        v_video: torch.Tensor,
+        action_attention_mask: torch.Tensor,
+        action_prompt_timestep: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run action stream against cached video K/V at this layer. The
+        cached K/V already had q_norm/k_norm and LTX SPLIT RoPE applied in
+        `_video_prefill`, so we just cat them onto action's K/V and run a
+        single SDPA call. Attention mask shape is `(T_action, T_video + T_action)`.
+        """
+        mot = self._mot_ref
+        block = self.action_block
+        io = _build_expert_attention_io_ltx(
+            block, x=action_tokens, pe=action_freqs, t_mod=action_t_mod,
+        )
+        k_cat = torch.cat([k_video, io["k"]], dim=1)
+        v_cat = torch.cat([v_video, io["v"]], dim=1)
+        attn_additive = _fastwam_mask_to_additive(
+            action_attention_mask.to(io["q"].device), io["q"].dtype
+        )
+        mixed = self._joint_attention(
+            io["q"], k_cat, v_cat, mot.num_heads, attn_additive
+        )
+        ctx = action_context_payload or {}
+        new_action_tokens = _apply_expert_post_block_ltx(
+            block=block,
+            io_state=io,
+            mixed_attn_out=mixed,
+            t_mod=action_t_mod,
+            context=ctx.get("context"),
+            context_mask=ctx.get("mask"),
+            prompt_timestep=action_prompt_timestep,
+        )
+        return new_action_tokens
+
     def _joint_attention(
         self,
         q: torch.Tensor,
@@ -302,7 +432,8 @@ class MoTBlock(nn.Module):
         v = rearrange(v, "b s (h d) -> b h s d", h=num_heads)
 
         def _attn(q_, k_, v_):
-            out = F.scaled_dot_product_attention(q_, k_, v_, attn_mask=attn_mask)
+            with sdpa_backend_ctx():
+                out = F.scaled_dot_product_attention(q_, k_, v_, attn_mask=attn_mask)
             return rearrange(out, "b h s d -> b s (h d)")
 
         mot = self._mot_ref
@@ -392,6 +523,18 @@ class MoT(nn.Module):
             ]
         )
 
+        # `mixtures.<expert>.blocks[i]` and `blocks[i].{video,action}_block`
+        # are the same nn.Module — state_dict traverses both, producing 4
+        # keys per block param. Under FSDP with
+        # `transformer_layer_cls_to_wrap=[MoTBlock]`, only the `blocks.*` path
+        # goes through MoTBlock's FSDP unit and receives the unsharded gather;
+        # the `mixtures.<>.blocks.*` path bypasses FSDP and yields sharded
+        # flat-param shards. Filtering the alias on save halves ckpt size
+        # and avoids saving broken sharded tensors. Load uses `strict=False`
+        # and the alias is restored by the shared nn.Module references
+        # reconstructed in `__init__`.
+        self._register_state_dict_hook(_drop_mixtures_blocks_alias)
+
     def _layer_does_ckpt(self, layer_idx: int) -> bool:
         return (layer_idx % self.mot_checkpoint_stride) == 0
 
@@ -429,6 +572,116 @@ class MoT(nn.Module):
                 prompt_timestep_all=prompt_timestep_all,
             )
         return tokens_all
+
+    def prefill_video_cache(
+        self,
+        video_tokens: torch.Tensor,
+        video_freqs: Tuple[torch.Tensor, torch.Tensor],
+        video_t_mod: torch.Tensor,
+        video_context_payload: Optional[dict],
+        video_attention_mask: torch.Tensor,
+        video_prompt_timestep: Optional[torch.Tensor] = None,
+    ) -> List[Dict[str, torch.Tensor]]:
+        """Two-pass inference, phase 1: run the full video stack alone and
+        return the post-rope K/V from every layer. Phase 2
+        (`forward_action_with_video_cache`) reuses these cached K/V so the
+        action denoiser can attend to a fixed prefix without re-encoding
+        video at every action denoise step.
+        """
+        if "video" not in self.mixtures:
+            raise ValueError("MoT requires `video` expert for `prefill_video_cache`.")
+        if video_attention_mask.ndim != 2:
+            raise ValueError(
+                f"`video_attention_mask` must be 2D [V, V], got shape {tuple(video_attention_mask.shape)}"
+            )
+        if video_attention_mask.shape[0] != video_attention_mask.shape[1]:
+            raise ValueError(
+                f"`video_attention_mask` must be square, got shape {tuple(video_attention_mask.shape)}"
+            )
+        if video_attention_mask.shape[0] != video_tokens.shape[1]:
+            raise ValueError(
+                "`video_attention_mask` seq length mismatch: "
+                f"mask={video_attention_mask.shape[0]} vs tokens={video_tokens.shape[1]}"
+            )
+
+        x = video_tokens
+        kv_cache: List[Dict[str, torch.Tensor]] = []
+        for layer_idx in range(self.num_layers):
+            x, k, v = self.blocks[layer_idx](
+                "video_prefill",
+                video_tokens=x,
+                video_freqs=video_freqs,
+                video_t_mod=video_t_mod,
+                video_context_payload=video_context_payload,
+                video_attention_mask=video_attention_mask,
+                video_prompt_timestep=video_prompt_timestep,
+            )
+            kv_cache.append({"k": k, "v": v})
+        return kv_cache
+
+    def forward_action_with_video_cache(
+        self,
+        action_tokens: torch.Tensor,
+        action_freqs: Tuple[torch.Tensor, torch.Tensor],
+        action_t_mod: torch.Tensor,
+        action_context_payload: Optional[dict],
+        video_kv_cache: List[Dict[str, torch.Tensor]],
+        attention_mask: torch.Tensor,
+        video_seq_len: int,
+        action_prompt_timestep: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Two-pass inference, phase 2. `attention_mask` must be the full
+        [V+A, V+A] joint mask used at training time; the action-row slice is
+        taken internally so the caller passes the same mask object as
+        `_build_mot_attention_mask` produced.
+        """
+        if "action" not in self.mixtures:
+            raise ValueError("MoT requires `action` expert for `forward_action_with_video_cache`.")
+        if len(video_kv_cache) != self.num_layers:
+            raise ValueError(
+                f"`video_kv_cache` must contain {self.num_layers} layers, got {len(video_kv_cache)}."
+            )
+        if attention_mask.ndim != 2:
+            raise ValueError(
+                f"`attention_mask` must be 2D [V+A, V+A], got shape {tuple(attention_mask.shape)}"
+            )
+        if attention_mask.shape[0] != attention_mask.shape[1]:
+            raise ValueError(
+                f"`attention_mask` must be square, got shape {tuple(attention_mask.shape)}"
+            )
+
+        action_seq_len = int(action_tokens.shape[1])
+        total_seq_len = int(video_seq_len) + action_seq_len
+        if attention_mask.shape[0] != total_seq_len:
+            raise ValueError(
+                "`attention_mask` seq length mismatch: "
+                f"mask={attention_mask.shape[0]} vs expected_total={total_seq_len}"
+            )
+        action_attention_mask = attention_mask[video_seq_len:total_seq_len, :total_seq_len]
+
+        x = action_tokens
+        for layer_idx in range(self.num_layers):
+            cache = video_kv_cache[layer_idx]
+            if "k" not in cache or "v" not in cache:
+                raise ValueError(f"`video_kv_cache[{layer_idx}]` must contain `k` and `v`.")
+            k_video = cache["k"]
+            v_video = cache["v"]
+            if k_video.shape[1] != video_seq_len or v_video.shape[1] != video_seq_len:
+                raise ValueError(
+                    f"`video_kv_cache[{layer_idx}]` seq len mismatch, expected {video_seq_len}."
+                )
+            x = self.blocks[layer_idx](
+                "action_with_kv",
+                action_tokens=x,
+                action_freqs=action_freqs,
+                action_t_mod=action_t_mod,
+                action_context_payload=action_context_payload,
+                k_video=k_video,
+                v_video=v_video,
+                action_attention_mask=action_attention_mask,
+                action_prompt_timestep=action_prompt_timestep,
+            )
+        return x
 
 
 __all__ = [

@@ -6,9 +6,18 @@ mixed_precision: bf16
 fsdp_config:
   fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
   fsdp_transformer_layer_cls_to_wrap: MoTBlock
-  fsdp_sharding_strategy: FULL_SHARD
+  # SHARD_GRAD_OP (ZeRO-2 style): shard gradients + optimizer state, but do NOT
+  # reshard parameters after forward. FULL_SHARD (ZeRO-3) re-all-gathers every
+  # layer's params in BOTH forward and backward; SHARD_GRAD_OP keeps them
+  # resident through the fwd→bwd window, eliminating the backward all-gather.
+  # Profiler showed ncclAllGather ~5-6.5s of a ~13-15s step — this targets it.
+  # Trade-off: higher peak VRAM (params stay unsharded); verify with a smoke run.
+  fsdp_sharding_strategy: SHARD_GRAD_OP
   fsdp_backward_prefetch: BACKWARD_PRE
-  fsdp_forward_prefetch: false
+  # Prefetch the next layer's all-gather during the current layer's forward so
+  # FSDP param comm overlaps compute instead of stalling the critical path.
+  # Profiler trace showed ncclAllGather dominating step time (~6.6s of ~15.5s).
+  fsdp_forward_prefetch: true
   fsdp_offload_params: false
   fsdp_state_dict_type: SHARDED_STATE_DICT
   fsdp_use_orig_params: true

@@ -47,7 +47,7 @@ class LTXAlignedActionDiT(nn.Module):
     keep the action expert small.
     """
 
-    ACTION_BACKBONE_SKIP_PREFIXES = ("action_encoder.", "head.")
+    ACTION_BACKBONE_SKIP_PREFIXES = ("action_encoder.", "head.", "context_proj.")
     ACTION_BACKBONE_META_KEYS = (
         "hidden_dim",
         "num_layers",
@@ -108,6 +108,16 @@ class LTXAlignedActionDiT(nn.Module):
         # ---- input head: action vectors -> hidden ----
         self.action_encoder = nn.Linear(action_dim, hidden_dim)
 
+        # ---- text context reprojection: text_dim -> hidden_dim ----
+        # Option F: the incoming LTX text context is text_dim (4096)-wide. We
+        # reproject it once, before the transformer blocks, so the per-block
+        # text cross-attention (attn2) operates with context_dim = hidden_dim
+        # instead of text_dim. attn2.to_k/to_v shrink from inner_dim x text_dim
+        # to inner_dim x hidden_dim. This projection has no video-DiT
+        # counterpart, so it is listed in ACTION_BACKBONE_SKIP_PREFIXES and
+        # stays randomly initialized by the backbone preprocess.
+        self.context_proj = nn.Linear(text_dim, hidden_dim)
+
         # ---- timestep AdaLN MLPs ----
         # adaln_embedding_coefficient(cross_attention_adaln=True) = 9 in ltx-core:
         #   3 (msa: shift/scale/gate) + 3 (mlp: shift/scale/gate) + 3 (cross-attn AdaLN)
@@ -118,11 +128,15 @@ class LTXAlignedActionDiT(nn.Module):
         )
 
         # ---- transformer blocks (LTX BasicAVTransformerBlock with dim=hidden_dim) ----
+        # context_dim = hidden_dim: text context is reprojected to hidden_dim
+        # in pre_dit before reaching the blocks (see self.context_proj). attn1
+        # (self-attn) is unaffected — its inner dim is num_heads*attn_head_dim
+        # = 4096 regardless of `dim`, which MoT joint attention requires.
         video_cfg = TransformerConfig(
             dim=hidden_dim,
             heads=num_heads,
             d_head=attn_head_dim,
-            context_dim=text_dim,
+            context_dim=hidden_dim,
             apply_gated_attention=apply_gated_attention,
             cross_attention_adaln=cross_attention_adaln,
         )
@@ -146,9 +160,20 @@ class LTXAlignedActionDiT(nn.Module):
         self.norm_out = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=eps)
         self.head = nn.Linear(hidden_dim, action_dim)
 
-        # Default init for the new buffers we own (the blocks' init is handled
-        # inside ltx_core; leaving it for now).
         nn.init.normal_(self.scale_shift_table, std=0.02)
+
+        # ltx_core's BasicAVTransformerBlock allocates per-block AdaLN
+        # `scale_shift_table` (and `prompt_scale_shift_table` when
+        # cross_attention_adaln=True) via torch.empty(...). LTX upstream relies
+        # on the pretrained safetensors checkpoint to overwrite them, but
+        # ActionDiT has no such checkpoint — leaving them uninitialised lets
+        # garbage (1e+38 / NaN) flow into the gate values and the network
+        # output diverges to nan on the first forward. Initialise to small
+        # normal so gates start at ~N(0, 0.02) + t_mod (finite, ~residual).
+        for block in self.blocks:
+            nn.init.normal_(block.scale_shift_table, std=0.02)
+            if getattr(block, "prompt_scale_shift_table", None) is not None:
+                nn.init.normal_(block.prompt_scale_shift_table, std=0.02)
 
         self.use_gradient_checkpointing = use_gradient_checkpointing
 
@@ -170,8 +195,9 @@ class LTXAlignedActionDiT(nn.Module):
         Args:
             action_tokens: (B, T, action_dim) noisy action tokens.
             timestep: (B,) batch-shared sigma.
-            context: (B, T_text, text_dim) text embeddings (already in
-                LTX cross-attn dim; we don't reproject).
+            context: (B, T_text, text_dim) text embeddings; reprojected here
+                to hidden_dim via self.context_proj so the per-block text
+                cross-attention (attn2) operates with context_dim = hidden_dim.
             context_mask: (B, T_text) binary mask, 1 for valid tokens.
 
         Returns a dict with keys: tokens, freqs, t_mod, embedded_timestep,
@@ -186,6 +212,12 @@ class LTXAlignedActionDiT(nn.Module):
 
         # 1) Embed action vectors to hidden_dim
         x = self.action_encoder(action_tokens)  # (B, T, hidden)
+
+        # 1b) Reproject the incoming text context (text_dim) -> hidden_dim once,
+        # before the transformer blocks. The blocks' attn2 is built with
+        # context_dim = hidden_dim (see TransformerConfig above).
+        if context is not None:
+            context = self.context_proj(context.to(x.dtype))  # (B, T_text, hidden)
 
         # 2) Build positions for LTX 3D RoPE: action token i has temporal index i,
         # height=0, width=0 (action lives on the temporal axis only).

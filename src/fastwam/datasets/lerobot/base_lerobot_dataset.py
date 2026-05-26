@@ -12,7 +12,7 @@ from .processors.base_processor import BaseProcessor
 
 logger = get_logger(__name__)
 
-MAX_GETITEM_ATTEMPT = 5
+MAX_GETITEM_ATTEMPT = 20
 
 class BaseLerobotDataset(torch.utils.data.Dataset):
     def __init__(
@@ -33,6 +33,13 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
 
         # sampling
         global_sample_stride: int = 1,
+
+        # optional whitelist of episode_index (one int per line); applied BEFORE
+        # the train/val split so val_set_proportion is taken from the kept set.
+        keep_episodes_path: Optional[str] = None,
+        # optional cap: keep only the first N entries of keep_episodes_path
+        # (manifest order). Lets one 50-line manifest drive a 20-episode run.
+        keep_episodes_limit: Optional[int] = None,
     ):
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
         assert past_action_size == 0
@@ -85,21 +92,36 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             meta["lerobot_key"] = f"action.{key}" if key != "default" else "action"
             delta_timestamps[meta["lerobot_key"]] = [(t * global_sample_stride) / fps for t in range(-past_action_size, -past_action_size + action_size)]
 
+        keep_set = None
+        if keep_episodes_path is not None:
+            with open(keep_episodes_path) as kf:
+                keep_order = [int(x) for x in kf.read().split() if x.strip()]
+            if keep_episodes_limit is not None:
+                keep_order = keep_order[:keep_episodes_limit]
+            keep_set = set(keep_order)
+            logger.info(
+                f"keep_episodes_path={keep_episodes_path}: whitelisting {len(keep_set)} "
+                f"episode indices" + (f" (limited to first {keep_episodes_limit})" if keep_episodes_limit is not None else "")
+            )
+
         episodes = {}
-        if val_set_proportion < 1e-6:
-            for meta in metas:
-                episodes.update({meta.repo_id: list(range(meta.total_episodes))})
-        else:
-            for meta in metas:
-                split_idx = int(meta.total_episodes * (1 - val_set_proportion))
+        for meta in metas:
+            full_indices = list(range(meta.total_episodes))
+            if keep_set is not None:
+                full_indices = [i for i in full_indices if i in keep_set]
+                logger.info(f"  [{meta.repo_id}] {meta.total_episodes} -> {len(full_indices)} episodes after keep filter")
+            if val_set_proportion < 1e-6:
+                episodes[meta.repo_id] = full_indices
+            else:
+                split_idx = int(len(full_indices) * (1 - val_set_proportion))
                 # random shuffle episode indices before splitting
-                episode_indices = list(range(meta.total_episodes))
+                episode_indices = list(full_indices)
                 rng = np.random.default_rng(seed)
                 rng.shuffle(episode_indices)
                 if self.is_training_set:
-                    episodes.update({meta.repo_id: [episode_indices[i] for i in range(split_idx)]})
+                    episodes[meta.repo_id] = episode_indices[:split_idx]
                 else:
-                    episodes.update({meta.repo_id: [episode_indices[i] for i in range(split_idx, meta.total_episodes)]})
+                    episodes[meta.repo_id] = episode_indices[split_idx:]
 
         self.multi_dataset = MultiLeRobotDataset(
             dataset_dirs=self.dataset_dirs,

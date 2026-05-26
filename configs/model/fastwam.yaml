@@ -8,7 +8,7 @@ attach_gemma_to_text_encoder: false
 proprio_dim: ${data.train.processor.proprio_output_dim}
 # FSDP wraps each MoTBlock with external CheckpointWrapper; internal ckpt would double-up and OOM.
 mot_checkpoint_mixed_attn: false
-action_dit_pretrained_path: null   # ActionDiT trains from random init (no alpha-scale yet).
+action_dit_pretrained_path: checkpoints/preprocessed/ltx_action_dit_backbone.pt
 skip_dit_load_from_pretrain: false
 
 # Video DiT: thin config consumed by LTXVideoDiT's loader; the heavy config is
@@ -19,26 +19,43 @@ video_dit_config:
   use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
   action_dim: ${data.train.processor.action_output_dim}
 
-# ActionDiT (LTX-isomorphic, hidden=1024, ~3.2B params at 48 layers).
+# ActionDiT (LTX-isomorphic, hidden=512, ~0.92B params at 48 layers).
+# Option F: text context is reprojected 4096->hidden once in pre_dit, so the
+# per-block text cross-attn (attn2) to_k/to_v shrink from 4096x4096 to 4096x512.
+# attn1 inner dim stays 4096 (num_heads*attn_head_dim) for MoT joint-attn concat.
 action_dit_config:
   action_dim: ${data.train.processor.action_output_dim}
-  hidden_dim: 1024
+  hidden_dim: 512
   num_heads: 32                       # 32 * 128 = 4096 inner_dim (matches LTX video block).
   attn_head_dim: 128
   num_layers: 48                      # Must match LTX video DiT num_layers.
   text_dim: 4096
   eps: 1.0e-06
-  cross_attention_adaln: false        # action hidden 1024 ≠ context 4096, plain cross-attn.
+  cross_attention_adaln: false        # action hidden 512 != context 4096, plain cross-attn.
   use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
 
-# LTX2Scheduler shifts (placeholder; replace with token-count-dependent ones in Task 14).
+# Video uses the LTX-2 stretched shifted logit-normal sampler (matches the
+# Lightricks reference trainer): shift = lerp(min_shift, max_shift) linear in
+# token count between min_tokens and max_tokens. `train_shift / sigma_floor`
+# are unused for type=ltx2 but kept here for diff visibility against the
+# Wan-style entry. `infer_shift` is used when building the inference schedule.
 video_scheduler:
-  train_shift: 5.0
-  infer_shift: 5.0
+  type: ltx2
+  min_shift: 0.95
+  max_shift: 2.05
+  min_tokens: 1024
+  max_tokens: 4096
+  infer_shift: 2.05
   num_train_timesteps: 1000
+  # ----- Wan-style fields (ignored when type=ltx2) -----
+  train_shift: 5.0
   sigma_floor: 0.0
 
+# Action stays Wan-style: the LTX paper's logit-normal shift schedule is video
+# specific. Robotwin action sequences are short (~8 tokens); a separate
+# calibration would be needed before swapping action to ltx2.
 action_scheduler:
+  type: wan
   train_shift: 5.0
   infer_shift: 5.0
   num_train_timesteps: 1000

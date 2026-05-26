@@ -6,28 +6,62 @@ defaults:
   - _self_
 
 # dataloading — A14B 14B + Wan2.1-VAE x4 tokens needs smaller batch
+# num_workers 16 + prefetch_factor 6 拉高了 dataloader 吞吐,中位步时 10s → 7s
+# (见 FASTWAM_LTX.md §2.10),CPU/内存负担可控。
 batch_size: 2
-num_workers: 8
+num_workers: 16
+prefetch_factor: 6
 
 model:
-  mot_checkpoint_mixed_attn: true
-  # stride=2 → only half of the 40 MoT layers checkpoint; rest store activations.
-  # ~2× activation memory of stride=1; if OOM, drop back to 1.
+  # FSDP already checkpoints each whole MoTBlock via accelerate_fsdp.yaml's
+  # `fsdp_activation_checkpointing: true`. Enabling FastWAM's internal
+  # mixed-attn checkpoint on top nests two checkpoint passes over the same
+  # compute → redundant recompute (and the OOM the model-config comment warns
+  # about). Keep only the FSDP-external checkpoint; internal stays off.
+  mot_checkpoint_mixed_attn: false
+  # Inert while mot_checkpoint_mixed_attn is false (stride only gates the
+  # internal checkpoint). Kept for visibility if internal ckpt is re-enabled.
   mot_checkpoint_stride: 2
+  # Push action branch gradient weight 2× the video branch. Action expert is
+  # smaller and easier to fit; weighting compensates and tends to lower
+  # action_l1 plateau. Matches the 50ep overfit tuning that drove raw action
+  # MSE to ~5e-4. Set to 1.0 to revert to release-config parity.
+  loss:
+    lambda_action: 2.0
 
 # scheduler
-# Match FastWAM-5B's 30k-step recipe: 30k optimizer steps over 27,500
-# RoboTwin2.0 demos at effective batch 2*8*7=112 ≈ 122 epochs of data.
-# (5B was 30k @ effective batch 128 ≈ 140 epochs; same order of magnitude.)
+# 50k optimizer steps over 27,500 RoboTwin2.0 demos at effective batch
+# 2*8*7=112 ≈ 204 epochs of data. Wider than the FastWAM-5B 30k recipe to
+# leave runway: at step 30k the cosine lr is ~5e-5 (still actively learning),
+# so we can early-stop or let it run to 50k as evidence dictates.
 lr_scheduler_type: "cosine"
 learning_rate: 1e-4
 num_epochs: 1000          # large cap; max_steps below is the real limit
-max_steps: 30000
+max_steps: 50000
+
+# State retention:
+#   - state_keep_last_n=2            → keep the latest 2 states for resume.
+#     Belt-and-suspenders after the 2026-05-24 incident: with =1, the OOM
+#     during step_7500 save wiped step_5000 (rotated first) and step_7500
+#     (mid-write) → total loss. =2 ensures the second-newest is always intact.
+#   - state_long_term_save_every=10000 + state_long_term_start=30000
+#     → additionally keep states at step 30000 / 40000 / 50000
+# Steady state (after step 50000) holds 4 state dirs ≈ 224 GB.
+# Weights/*.pt are broken (FSDP gather bug per runbook §15) so the only path
+# to an eval-able ckpt is DCP consolidation from state/.
+state_keep_last_n: 2
+state_long_term_save_every: 10000
+state_long_term_start: 30000
 log_every: 10
-save_every: 2500
+save_every: 1000
 eval_every: 500
 
 # training — per-GPU micro batch=2, grad_accum=8, 7 GPUs => effective batch 112
 gradient_accumulation_steps: 8
 weight_decay: 1e-2
 resume: null
+
+# adamw8bit is required for FSDP + this batch/grad_accum to fit in 80GB H100.
+# Default `adamw` (fp32 moments) costs +12 GB/rank for optimizer state on 14B
+# params and OOMs at first training step. See FASTWAM_LTX.md §2.11.
+optimizer_type: "adamw8bit"

@@ -5,6 +5,7 @@ import math
 from typing import Any, Dict, Tuple, Optional
 from einops import rearrange
 from .helpers.gradient import gradient_checkpoint_forward
+from .helpers.attention_backend import sdpa_backend_ctx
 
 from fastwam.utils.logging_config import get_logger
 
@@ -16,7 +17,8 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
         v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        x = F.scaled_dot_product_attention(q, k, v, attn_mask=ctx_mask)
+        with sdpa_backend_ctx():
+            x = F.scaled_dot_product_attention(q, k, v, attn_mask=ctx_mask)
         x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
         return x
     else:

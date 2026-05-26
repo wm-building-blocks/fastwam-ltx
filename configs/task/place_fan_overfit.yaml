@@ -1,0 +1,44 @@
+# @package _global_
+
+# Overfit sanity experiment: FastWAM-LTX on RoboTwin place_fan, demo_clean only.
+# Manifest place_fan_clean_50ep.txt lists all 50 clean episodes (16500-16549);
+# keep_episodes_limit=20 trains on just the first 20 for a fast signal.
+
+defaults:
+  - override /data: robotwin
+  - override /model: fastwam
+  - _self_
+
+batch_size: 2
+
+model:
+  mot_checkpoint_mixed_attn: false
+  mot_checkpoint_stride: 2
+
+# 50-episode clean manifest, first 20 used; no val split (eval runs on the
+# same 20 episodes — for overfit that is exactly the memorization check).
+data:
+  train:
+    keep_episodes_path: ./data/robotwin2.0/place_fan_clean_50ep.txt
+    keep_episodes_limit: 20
+    val_set_proportion: 0
+  val:
+    keep_episodes_path: ./data/robotwin2.0/place_fan_clean_50ep.txt
+    keep_episodes_limit: 20
+    val_set_proportion: 0
+
+# scheduler — constant LR so the loss curve is easy to read for overfit.
+lr_scheduler_type: "constant"
+learning_rate: 1e-4
+num_epochs: 100000        # large cap; max_steps below is the real limit
+max_steps: 2000
+log_every: 10
+save_every: 250
+eval_every: 500
+
+# training — micro batch=2, grad_accum=1, 7 GPUs => effective batch 14
+gradient_accumulation_steps: 1
+weight_decay: 1e-2
+resume: null
+compile_mot: false
+optimizer_type: "adamw8bit"

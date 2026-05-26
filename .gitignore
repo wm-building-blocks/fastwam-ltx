@@ -38,6 +38,7 @@ evaluate_results/
 *.exe
 *.dll
 *.swp
+*.bak*
 *.vscode
 *.DS_Store
 *.pyc
